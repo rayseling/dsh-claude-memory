@@ -1,0 +1,34 @@
+{
+  "name": "dsh-claude-memory",
+  "version": "0.1.0",
+  "description": "Loads the Claude Code auto-memory index (~/.claude/projects/<slug>/memory/MEMORY.md) of the session's project into every DeepSeek Harness session, the way Claude Code itself loads it: the index at the first step, topic files on demand.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./locate": "./src/locate.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "*"
+  }
+}
