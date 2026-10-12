@@ -1,0 +1,39 @@
+# Git hooks (lefthook). 本地检查点只做秒级的事；CI 拥有全量门禁矩阵。
+# 结构搬自 DeepSeek Harness lefthook.yml，去掉了其 vendor / 第三方声明 / 双语配对三项。
+# 安装：npx lefthook install（建议写进 package.json 的 postinstall）。
+# 复制到宿主仓库根目录 lefthook.yml 后，按实际 Skill 安装路径和 lint/typecheck 命令调整。
+
+pre-commit:
+  jobs:
+    # 归档封印：只在动了归档区时才跑，否则零开销。
+    - name: archived agent notes
+      glob: '.agents/notes/archived/**'
+      run: npx tsx .agents/skills/write-notes-like-deepseek/scripts/verify-archived-agent-notes.ts
+
+    # 指令字数上限：只在动了被预算的文件时才跑。
+    - name: doc budgets
+      glob: '{AGENTS.md,**/AGENTS.md,docs/**/*.md}'
+      run: npx tsx .agents/skills/dsh-layer-instructions/scripts/verify-doc-budgets.ts
+
+    # staged lint 自动修并回灌暂存区。换成宿主实际的 linter；没有就删掉这一项。
+    # - name: lint (staged)
+    #   glob: '*.{ts,tsx,mts,cts,mjs}'
+    #   run: npx eslint --fix {staged_files}
+    #   stage_fixed: true
+
+    - name: whitespace (staged)
+      run: git diff --cached --check
+
+pre-merge-commit:
+  jobs:
+    - name: archived agent notes
+      glob: '.agents/notes/archived/**'
+      run: npx tsx .agents/skills/write-notes-like-deepseek/scripts/verify-archived-agent-notes.ts
+
+pre-push:
+  jobs:
+    # 只跑增量 typecheck，不跑测试；测试按改动面选（dsh-pre-push-checks）。
+    # - name: typecheck
+    #   run: npx tsc --noEmit
+    - name: gates manifest parses
+      run: npx tsx .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts --list

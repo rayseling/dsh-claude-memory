@@ -1,0 +1,19 @@
+{
+  "patterns": {
+    "ts-ignore": "@ts-ignore|@ts-expect-error|@ts-nocheck",
+    "eslint-disable": "eslint-disable",
+    "empty-catch": "catch\\s*(\\([^)]*\\))?\\s*\\{\\s*\\}"
+  },
+  "extensions": [
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts"
+  ],
+  "exclude": [
+    "node_modules/",
+    ".agents/",
+    ".claude/"
+  ],
+  "baseline": {}
+}

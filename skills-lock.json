@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "skills": {
+    "dsh-create-upgrade-guide": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-create-upgrade-guide/SKILL.md",
+      "computedHash": "336bc47c50f728e7d757ecbbc431139e3e9a67d0c220d6690aaf10d5e968c3ba"
+    },
+    "dsh-error-handling": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-error-handling/SKILL.md",
+      "computedHash": "936b3c9de6629ef8245ef4cc5d6091a755f9f1770a1e049294208a1fad3c84b0"
+    },
+    "dsh-gate-every-rule": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-gate-every-rule/SKILL.md",
+      "computedHash": "9117f8195c086f7e6078c9884915ca405977972e7b9b840706a43ee156aacc50"
+    },
+    "dsh-layer-instructions": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-layer-instructions/SKILL.md",
+      "computedHash": "b9ad4cf9ea6112cf3ab34ca8fa05e9d531d9fce6f8e2de4efca0a4182afda70c"
+    },
+    "dsh-pre-push-checks": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-pre-push-checks/SKILL.md",
+      "computedHash": "8083ee8dbd4886a6a6b2eace754a8d6a45b0e4d6d77fe38ba8c312bdd60a19ec"
+    },
+    "dsh-prose-standard": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-prose-standard/SKILL.md",
+      "computedHash": "a6133a17cf2fab2b04601e9299d09bf76a27025e29eea7b5b5ad964536fc4da6"
+    },
+    "dsh-trim-cot-leakage": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-trim-cot-leakage/SKILL.md",
+      "computedHash": "70673b816d0a1bcac6194294b568d9b100f35bc9958df1269bc930742807428a"
+    },
+    "write-notes-like-deepseek": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/write-notes-like-deepseek/SKILL.md",
+      "computedHash": "53c9ed23c5e39286a3e2ef69f934f48b57574a895f61ce792741563d3f3e3b28"
+    }
+  }
+}

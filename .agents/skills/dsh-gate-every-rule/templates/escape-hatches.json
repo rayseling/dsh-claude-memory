@@ -1,0 +1,13 @@
+{
+  "patterns": {
+    "as-unknown": "\\bas unknown\\b|<unknown>",
+    "as-any": "\\bas any\\b|<any>",
+    "ts-ignore": "@ts-ignore|@ts-expect-error|@ts-nocheck",
+    "eslint-disable": "eslint-disable|oxlint-disable|biome-ignore",
+    "py-type-ignore": "#\\s*type:\\s*ignore",
+    "py-noqa": "#\\s*noqa"
+  },
+  "extensions": [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".py"],
+  "exclude": ["vendor/", "dist/", "build/", "node_modules/", ".agents/notes/archived/"],
+  "baseline": {}
+}

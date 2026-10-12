@@ -1,0 +1,11 @@
+{
+  "gates": [
+    { "name": "agent-note-tree", "command": "node .agents/skills/write-notes-like-deepseek/scripts/verify-agent-note-tree.ts" },
+    { "name": "agent-note-format", "command": "node .agents/skills/write-notes-like-deepseek/scripts/verify-agent-note-format.ts" },
+    { "name": "archived-agent-notes", "command": "node .agents/skills/write-notes-like-deepseek/scripts/verify-archived-agent-notes.ts" },
+    { "name": "doc-budgets", "command": "node .agents/skills/dsh-layer-instructions/scripts/verify-doc-budgets.ts" },
+    { "name": "md-links", "command": "node .agents/skills/dsh-gate-every-rule/scripts/verify-md-links.ts" },
+    { "name": "escape-hatch-baseline", "command": "node .agents/skills/dsh-gate-every-rule/scripts/verify-escape-hatch-baseline.ts" },
+    { "name": "upgrade-guides", "command": "node .agents/skills/dsh-create-upgrade-guide/scripts/verify-upgrade-guides.ts" }
+  ]
+}

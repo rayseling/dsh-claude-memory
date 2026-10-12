@@ -39,3 +39,11 @@ dsh-claude-memory 是一个 DeepSeek Harness(dsh)插件:在每个会话第一步
 
 - 不写记忆、不做摘要、不做检索、不加 UI。
 - 不碰 dsh 主仓库;dsh 的接口变了就改这里,不改那边。
+
+## 开工规矩(skills)
+
+- 非平凡改动先按 [write-notes-like-deepseek](.agents/skills/write-notes-like-deepseek/SKILL.md) 立或更新 Agent Note;上面「设计决策」一节是待迁入 `.agents/notes/implemented/` 的存量。
+- 推送前按 [dsh-pre-push-checks](.agents/skills/dsh-pre-push-checks/SKILL.md) 只跑覆盖本次改动的检查;`node .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts` 跑全部门禁。
+- 改了 `cordis.patch.yml` 的键、`Config` 字段或注入文本格式,同批按 [dsh-create-upgrade-guide](.agents/skills/dsh-create-upgrade-guide/SKILL.md) 写升级指南。
+- 错误处理按 [dsh-error-handling](.agents/skills/dsh-error-handling/SKILL.md);注释与文档按 [dsh-prose-standard](.agents/skills/dsh-prose-standard/SKILL.md),会话痕迹用 [dsh-trim-cot-leakage](.agents/skills/dsh-trim-cot-leakage/SKILL.md) 清。
+- 本文件字数上限在 `.agents/doc-budgets.json`,只降不升;加规则先把细节下沉到链接目标([dsh-layer-instructions](.agents/skills/dsh-layer-instructions/SKILL.md))。
