@@ -38,7 +38,7 @@ const BANNED_IMPLEMENTED = new Set([
   "## 验收标准", "## 验收条件", "## 接受标准",
 ]);
 
-const ALTERNATIVES_RE = /^## (?:Alternatives considered|.{0,8}?(?:替代方案|备选(?:方案)?))$/;
+const ALTERNATIVES_RE = /^## (?:Alternatives considered|.{0,8}?(?:替代方案|备选(?:方案)?|考虑过的方案))$/;
 const FORMAT_ADOPTED = "2026-07-05";
 const GRANDFATHER = "<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->";
 
@@ -145,7 +145,7 @@ for (const note of notes) {
   const hasGrandfather = rawText.includes(GRANDFATHER);
   if (hasSection && hasGrandfather) fail("carries both ## Alternatives considered and grandfather comment — drop the comment");
   if (!hasSection && !hasGrandfather) {
-    fail("missing ## Alternatives considered / ## 备选方案");
+    fail("missing ## Alternatives considered / ## 备选方案 / ## 考虑过的方案");
   }
   if (hasGrandfather && note.date >= FORMAT_ADOPTED) fail(`grandfather comment only valid before ${FORMAT_ADOPTED}`);
 }

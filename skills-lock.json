@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "dsh-agent-experience": {
+      "source": "rayseling/write-notes-like-deepseek",
+      "sourceType": "github",
+      "skillPath": "skills/dsh-agent-experience/SKILL.md",
+      "computedHash": "0519210df04df8ba22aba4c714e034255b66ea9ac95c60cce200379f51cabca6"
+    },
     "dsh-create-upgrade-guide": {
       "source": "rayseling/write-notes-like-deepseek",
       "sourceType": "github",
@@ -47,7 +53,7 @@
       "source": "rayseling/write-notes-like-deepseek",
       "sourceType": "github",
       "skillPath": "skills/write-notes-like-deepseek/SKILL.md",
-      "computedHash": "9a9855f80ccadf209edd7ae7cbf0129368fcc151e0e90ff7d3c5092b4af7b491"
+      "computedHash": "0d2e69affab267a5f4c6fe9ed16671071eb6ace81eabf299a3a13af630aa3f84"
     }
   }
 }

@@ -104,8 +104,8 @@ function parseNoteContent(raw: string, relPath: string, slugToId: Map<string, st
   }
 
   const problem = extractSection('Problem|问题');
-  const decision = extractSection('Decision|Proposal|决策|提案');
-  const alternatives = extractSection('Alternatives considered|曾考虑的替代方案|曾考虑的备选');
+  const decision = extractSection('Decision|Proposal|决策|决定|提案');
+  const alternatives = extractSection('Alternatives considered|.{0,8}?(?:替代方案|备选(?:方案)?|考虑过的方案)');
   const consequences = extractSection('Consequences|后果');
 
   const links: string[] = [];

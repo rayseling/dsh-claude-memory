@@ -10,7 +10,7 @@
 2. **`verify-agent-note-format`**（`scripts/verify-agent-note-format.ts`）
    - 头部：第 1 行 `# Agent Note:` 标题（半角/全角冒号都收，中文输入法常打出全角）、第 2/4 行空行、第 3 行 `Status:` 与 lifecycle 一致且全篇唯一。
    - 骨架：首节必须 `## Problem`/`## 问题`；per-lifecycle 必需节匹配中英别名（`## Decision`/`## 决策`、`## Consequences`/`## 后果` 等；`## Decision（说明）` 这类括号后缀会先剥掉再匹配）；`implemented` 禁用提案式标题（`## Proposal`/`## Plan`/`## Migration plan`/`## Acceptance criteria` 及其中文别名）。现在时是散文纪律，不扫正文。
-   - 备选方案：`## Alternatives considered` / `## 备选方案` / `## 已考虑的替代方案` 等别名必写。脚本不检查「不做/复用」档，也不接受占位注释豁免。
+   - 备选方案：`## Alternatives considered` / `## 备选方案` / `## 已考虑的替代方案` / `## 考虑过的方案` 等别名必写；看板按同一组别名抽取备选节。脚本不检查「不做/复用」档，也不接受占位注释豁免。
    - 兼容：CRLF/BOM 自动归一。
 
 3. **`verify-archived`**（`scripts/verify-archived-agent-notes.ts`，标配）
