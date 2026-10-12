@@ -101,6 +101,8 @@ export async function projectRoots(cwd) {
 
 /**
  * Locate the Claude Code memory index that applies to a working directory.
+ * Absence (`ENOENT`, `ENOTDIR`) is a result; any other stat failure is thrown,
+ * because a file that exists but cannot be inspected is not a file that is gone.
  * @param {string} cwd - absolute session working directory.
  * @param {string} claudeHome - Claude Code configuration directory (normally `~/.claude`).
  * @returns {Promise<{ root: string, path: string, size: number, mtimeMs: number } | undefined>} the
@@ -109,8 +111,14 @@ export async function projectRoots(cwd) {
 export async function locateMemoryIndex(cwd, claudeHome) {
   for (const root of await projectRoots(cwd)) {
     const path = join(claudeHome, 'projects', slugOf(root), 'memory', 'MEMORY.md')
-    const info = await statOrUndefined(path)
-    if (info?.isFile()) return { root, path, size: info.size, mtimeMs: info.mtimeMs }
+    let info
+    try {
+      info = await stat(path)
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue
+      throw error
+    }
+    if (info.isFile()) return { root, path, size: info.size, mtimeMs: info.mtimeMs }
   }
   return undefined
 }
@@ -172,11 +180,16 @@ export function truncateIndex(text, { maxLines, maxChars }) {
 export async function readIndex(path, limits) {
   const budget = 3 * limits.maxChars + 1
   const handle = await open(path, 'r')
-  let buffer
+  let buffer = Buffer.alloc(budget)
   try {
-    buffer = Buffer.alloc(budget)
-    const { bytesRead } = await handle.read(buffer, 0, budget, 0)
-    buffer = buffer.subarray(0, bytesRead)
+    // A read may return fewer bytes than asked without reaching the end.
+    let filled = 0
+    while (filled < budget) {
+      const { bytesRead } = await handle.read(buffer, filled, budget - filled, filled)
+      if (bytesRead === 0) break
+      filled += bytesRead
+    }
+    buffer = buffer.subarray(0, filled)
   } finally {
     await handle.close()
   }

@@ -9,7 +9,7 @@ dsh-claude-memory 是一个 DeepSeek Harness(dsh)插件:在每个会话第一步
 - **只读。** 记忆由 Claude Code 维护;本插件永远不创建、不修改、不删除 `~/.claude` 下任何文件,注入文本也要求模型不这么做。
 - **消息是 `user/message` 事件,来源 `plugin:claude-memory`,form `snapshot`。** 这样它随会话日志重放、压缩、续聊,模型可见内容都可从日志重建(dsh 的"model-visible ⟺ logged"规则)。`kind: 'plugin'` 是 V4 格式拒绝的旧写法,不要用。
 - **去重状态放在会话投影里,不扫历史。** `Session.eventAt/snapshotEvents/ownEvents` 已被 dsh 弃用并禁止新增调用(agents note 2026-09-09),所以用 `ctx.sessionProjections.register` 注册 `claudeMemory` 投影:纯折叠,记录本插件最新一条在 surface 上的 snapshot 的 seq/digest/path,`user/message` 命中时更新,`surfaceOp.op === 'replace'` 覆盖到该 seq 时清空(压缩后会重新注入)。pre-step 只读 `stateOf`。`stateSchema` 是手写的 `{ parse }`,不引入 zod。改了状态字段或折叠语义必须 bump `stateVersion`。
-- **摘要相同不注入,不同就新 snapshot 覆盖;记忆消失要撤回。** 展示过的索引文件不见了或变空,进入一条撤回 snapshot(同样带 digest,所以只进一次),否则模型会一直把旧索引当现状。
+- **摘要相同不注入,不同就新 snapshot 覆盖;记忆消失要撤回,读不到不算消失。** 展示过的索引文件不见了(stat 得 ENOENT/ENOTDIR)或变空,进入一条撤回 snapshot(同样带 digest,所以只进一次),否则模型会一直把旧索引当现状。读失败、stat 得其它错误(EACCES/EIO)说明不了内容,`currentIndex` 用判别式 `kind: 'text' | 'blank' | 'error'` 区分,error 不缓存、不撤回、每会话只警告一次;冷缓存加一次抖动曾经造出过假撤回(0.2.0)。
 - **没有记录的工作目录就不注入。** `header.cwd` 可能缺失;退回 `process.cwd()` 会把 dsh 进程所在项目(通常是 harness 仓库或 profile)的记忆塞给别的项目,模型无从分辨。
 - **插入位置找不到锚点就放尾部。** 上游监听器可能把 claimed 消息换成副本,`findLastIndex` 得 -1 时若按 0 插入会排到用户提问前面。
 - **定位顺序:git 根 → linked worktree 的主仓库 → 工作目录。** Claude Code 的 slug 取自仓库根(路径非字母数字字符全换成 `-`),文档说记忆跨 worktree 共用,但旧版给 worktree 路径单独建过目录,所以两个都试。全部用 fs 判断,不 spawn git。

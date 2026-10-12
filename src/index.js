@@ -75,6 +75,12 @@ function digestOf(text) {
 
 /**
  * Validator for the persisted projection state (plain JSON).
+ *
+ * The registry's public type names a zod `ZodType`, but it erases the schema
+ * to `{ parse(value) }` and calls only `parse` (session-projection
+ * `ErasedDefinition`); this object satisfies that structural use without a
+ * zod dependency. A host that starts calling `safeParse` would need a real
+ * schema here.
  * @type {{ parse(value: unknown): { seq: number | null, digest: string | null, path: string | null } }}
  */
 export const projectionStateSchema = {
@@ -146,8 +152,11 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The current index message for a located file, from cache when unchanged.
-   * @returns {Promise<{ text: string, digest: string } | undefined>} undefined for a blank index.
+   * The current index message for a located file, from cache when its size
+   * and mtime hold (an in-place rewrite that preserves both is not noticed).
+   * A read failure is reported as its own kind and never cached: it says
+   * nothing about the file's content, so the caller must not withdraw.
+   * @returns {Promise<{ kind: 'text', text: string, digest: string } | { kind: 'blank' } | { kind: 'error' }>}
    */
   const currentIndex = async (session, located) => {
     const cached = rendered.get(located.path)
@@ -157,12 +166,15 @@ export function apply(ctx, config) {
       index = await readIndex(located.path, limits)
     } catch (error) {
       warnOnce(session, located.path, `claude-memory: cannot read ${located.path}: ${error.message}`)
-      return undefined
+      return { kind: 'error' }
     }
-    const value = index.text.trim().length === 0
-      ? undefined
-      : { text: renderIndexMessage({ path: located.path, ...index }) }
-    if (value !== undefined) value.digest = digestOf(value.text)
+    let value
+    if (index.text.trim().length === 0) {
+      value = { kind: 'blank' }
+    } else {
+      const text = renderIndexMessage({ path: located.path, ...index })
+      value = { kind: 'text', text, digest: digestOf(text) }
+    }
     rendered.set(located.path, { size: located.size, mtimeMs: located.mtimeMs, value })
     return value
   }
@@ -178,7 +190,14 @@ export function apply(ctx, config) {
     if (cwd === undefined) return decision
     const state = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
     if (state === undefined) throw new Error('claude-memory requires its session projection to be registered')
-    const located = await locateMemoryIndex(cwd, claudeHome)
+    let located
+    try {
+      located = await locateMemoryIndex(cwd, claudeHome)
+    } catch (error) {
+      // The file may exist but cannot be inspected right now; say nothing rather than withdraw.
+      warnOnce(session, cwd, `claude-memory: cannot inspect the memory index for ${cwd}: ${error.message}`)
+      return decision
+    }
     signal.throwIfAborted()
     let message
     if (located === undefined) {
@@ -187,7 +206,8 @@ export function apply(ctx, config) {
     } else {
       const index = await currentIndex(session, located)
       signal.throwIfAborted()
-      if (index === undefined) {
+      if (index.kind === 'error') return decision
+      if (index.kind === 'blank') {
         if (state.digest === null) return decision
         message = snapshotMessage(renderWithdrawnMessage(located.path), located.path)
       } else {

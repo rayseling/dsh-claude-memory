@@ -119,6 +119,23 @@ test('decodeCompletePrefix drops an unfinished trailing sequence only', () => {
   assert.equal(decodeCompletePrefix(Buffer.alloc(0)), '')
 })
 
+test('locateMemoryIndex throws on a stat failure that is not absence', async () => {
+  const home = scratch()
+  const project = scratch()
+  const dir = join(home, 'projects', slugOf(project), 'memory')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'MEMORY.md'), '- a\n')
+  const { chmodSync, statSync } = await import('node:fs')
+  chmodSync(dir, 0o000)
+  let inspectable = true
+  try { statSync(join(dir, 'MEMORY.md')) } catch { inspectable = false }
+  try {
+    if (!inspectable) await assert.rejects(locateMemoryIndex(project, home), { code: 'EACCES' })
+  } finally {
+    chmodSync(dir, 0o755)
+  }
+})
+
 test('readIndex reads a bounded window and marks a continuing file as truncated', async () => {
   const dir = scratch()
   const small = join(dir, 'small.md')

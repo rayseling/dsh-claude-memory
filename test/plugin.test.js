@@ -231,6 +231,52 @@ test('reuses the rendered index while size and mtime hold, and re-reads when the
   assert.ok(fresh.messages[1].content[0].text.includes('- three!'))
 })
 
+test('a read failure after the index was shown never withdraws it, and the next successful read is cached fresh', async () => {
+  const { home, project, path } = seedProject('- one\n')
+  const { listener, logs, commit } = mount({ claudeHome: home })
+  const { chmodSync, readFileSync } = await import('node:fs')
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  commitAll(commit, agent.session, first, 1)
+  utimesSync(path, 1_700_000_000, 1_700_000_000) // invalidate the rendered cache
+  chmodSync(path, 0o000)
+  let readable = true
+  try { readFileSync(path) } catch { readable = false }
+  try {
+    if (!readable) {
+      const during = await run(listener, { agent })
+      assert.equal(during.messages.length, 1, 'read error: no withdrawal, no re-entry')
+      assert.deepEqual(logs.map(([level]) => level), ['info', 'warn'])
+    }
+  } finally {
+    chmodSync(path, 0o644)
+  }
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'same content readable again: still deduplicated')
+  writeFileSync(path, '- changed\n')
+  assert.ok((await run(listener, { agent })).messages[1].content[0].text.includes('- changed'))
+})
+
+test('an uninspectable memory directory after the index was shown never withdraws it', async () => {
+  const { home, project, path } = seedProject('- one\n')
+  const { listener, logs, commit } = mount({ claudeHome: home })
+  const { chmodSync, statSync } = await import('node:fs')
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  commitAll(commit, agent.session, first, 1)
+  const dir = join(path, '..')
+  chmodSync(dir, 0o000)
+  let inspectable = true
+  try { statSync(path) } catch { inspectable = false }
+  try {
+    if (!inspectable) {
+      assert.equal((await run(listener, { agent })).messages.length, 1)
+      assert.equal(logs.at(-1)[0], 'warn')
+    }
+  } finally {
+    chmodSync(dir, 0o755)
+  }
+})
+
 test('warns once per session for an unreadable index', async () => {
   const { home, project, path } = seedProject('- one\n')
   const { listener, logs } = mount({ claudeHome: home })
