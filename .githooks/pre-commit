@@ -1,0 +1,11 @@
+#!/bin/sh
+# Second-scale checks only; the full gate set runs on pre-push and in CI.
+set -e
+staged=$(git diff --cached --name-only)
+if printf '%s\n' "$staged" | grep -q '^\.agents/notes/archived/'; then
+  node .agents/skills/write-notes-like-deepseek/scripts/verify-archived-agent-notes.ts
+fi
+if printf '%s\n' "$staged" | grep -qE '^(AGENTS\.md|README\.md|\.agents/doc-budgets\.json)$'; then
+  node .agents/skills/dsh-layer-instructions/scripts/verify-doc-budgets.ts
+fi
+git diff --cached --check

@@ -1,0 +1,25 @@
+name: Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Run every gate
+        env:
+          # The archive seal compares against the pre-change commit: PR base, or the previous tip of the pushed branch.
+          AGENT_NOTE_ARCHIVE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts

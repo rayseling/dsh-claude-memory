@@ -33,6 +33,7 @@ dsh-claude-memory 是一个 DeepSeek Harness(dsh)插件:在每个会话第一步
 ## 开工规矩(skills)
 
 - 非平凡改动先按 [write-notes-like-deepseek](.agents/skills/write-notes-like-deepseek/SKILL.md) 立或更新 Agent Note;已有归属的决定就地改事实,不另起新篇。
+- 每个 clone 跑一次 `git config core.hooksPath .githooks`,提交和推送自动过门禁([为什么不用 lefthook](.agents/notes/implemented/process/2026-10-12-git-hooks-and-ci-without-lefthook.md))。
 - 推送前按 [dsh-pre-push-checks](.agents/skills/dsh-pre-push-checks/SKILL.md) 只跑覆盖本次改动的检查;`node .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts` 跑全部门禁。
 - 改了 `cordis.patch.yml` 的键、`Config` 字段或注入文本格式,同批按 [dsh-create-upgrade-guide](.agents/skills/dsh-create-upgrade-guide/SKILL.md) 写升级指南。
 - 错误处理按 [dsh-error-handling](.agents/skills/dsh-error-handling/SKILL.md);注释与文档按 [dsh-prose-standard](.agents/skills/dsh-prose-standard/SKILL.md),会话痕迹用 [dsh-trim-cot-leakage](.agents/skills/dsh-trim-cot-leakage/SKILL.md) 清。

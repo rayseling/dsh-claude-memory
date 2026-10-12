@@ -1,0 +1,5 @@
+#!/bin/sh
+# Every gate plus the test suite: both finish in about a second.
+set -e
+node .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts
+node --test test/
