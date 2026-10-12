@@ -13,7 +13,7 @@
  * @module dsh-claude-memory/locate
  */
 
-import { open, readFile, stat } from 'node:fs/promises'
+import { open, readFile, realpath, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 /**
@@ -26,15 +26,39 @@ export function slugOf(path) {
 }
 
 /**
- * @param {string} path
- * @returns {Promise<import('node:fs').Stats | undefined>} stats, or undefined when the path is absent or unreadable.
+ * Whether a filesystem error means the path is simply not there. Every other
+ * failure (EACCES, EIO, ELOOP, ...) says nothing about what exists and is
+ * passed on, so a caller never mistakes "cannot look" for "absent".
+ * @param {unknown} error - error thrown by `node:fs`.
+ * @returns {boolean} true for `ENOENT` and `ENOTDIR`.
  */
-async function statOrUndefined(path) {
+export function isAbsence(error) {
+  return error?.code === 'ENOENT' || error?.code === 'ENOTDIR'
+}
+
+/**
+ * @param {string} path
+ * @returns {Promise<import('node:fs').Stats | undefined>} stats, or undefined when the path is absent.
+ */
+async function statOrAbsent(path) {
   try {
     return await stat(path)
-  } catch {
-    // ENOENT, ENOTDIR, EACCES all mean "not a usable entry" here.
-    return undefined
+  } catch (error) {
+    if (isAbsence(error)) return undefined
+    throw error
+  }
+}
+
+/**
+ * @param {string} path
+ * @returns {Promise<string | undefined>} file text, or undefined when the path is absent.
+ */
+async function readOrAbsent(path) {
+  try {
+    return await readFile(path, 'utf8')
+  } catch (error) {
+    if (isAbsence(error)) return undefined
+    throw error
   }
 }
 
@@ -42,13 +66,13 @@ async function statOrUndefined(path) {
  * Nearest ancestor of `start` (inclusive) holding a `.git` entry.
  * @param {string} start - absolute directory to walk up from.
  * @returns {Promise<{ root: string, isFile: boolean, path: string } | undefined>} the
- *   repository root, whether `.git` is a file (linked worktree) or a directory, and the entry path.
+ *   repository root, whether `.git` is a file (linked worktree or separate git dir) or a directory, and the entry path.
  */
 export async function findGitEntry(start) {
   let dir = resolve(start)
   for (;;) {
     const candidate = join(dir, '.git')
-    const info = await statOrUndefined(candidate)
+    const info = await statOrAbsent(candidate)
     if (info !== undefined) return { root: dir, isFile: info.isFile(), path: candidate }
     const parent = dirname(dir)
     if (parent === dir) return undefined
@@ -57,45 +81,70 @@ export async function findGitEntry(start) {
 }
 
 /**
- * Main repository root recorded by a linked worktree's `.git` file.
- * @param {string} gitFile - path of the `.git` file (`gitdir: <main>/.git/worktrees/<name>`).
- * @returns {Promise<string | undefined>} `<main>`, or undefined when the file does not name a worktree gitdir.
+ * Git directory named by a `.git` file (`gitdir: <path>`), absolute.
+ * @param {string} gitFile - path of the `.git` file.
+ * @returns {Promise<string | undefined>} the git directory, or undefined when the file names none.
  */
-export async function mainRootOfWorktree(gitFile) {
-  let text
-  try {
-    text = await readFile(gitFile, 'utf8')
-  } catch {
-    // An unreadable `.git` file yields no main root; the worktree path itself still applies.
-    return undefined
-  }
+async function gitdirOf(gitFile) {
+  const text = await readOrAbsent(gitFile)
+  if (text === undefined) return undefined
   const match = /^gitdir:\s*(.+)$/m.exec(text)
   if (match === null) return undefined
   const raw = match[1].trim()
-  const gitdir = isAbsolute(raw) ? raw : resolve(dirname(gitFile), raw)
-  const marker = `${sep}.git${sep}worktrees${sep}`
-  const index = gitdir.lastIndexOf(marker)
-  return index === -1 ? undefined : gitdir.slice(0, index)
+  return isAbsolute(raw) ? raw : resolve(dirname(gitFile), raw)
+}
+
+/**
+ * Main repository root for a linked worktree's `.git` file, read the way git
+ * resolves it: the worktree's git directory names its common directory in
+ * `commondir`, and a common directory that is a repository's own `.git`
+ * sits directly under that repository's root. A main repository whose git
+ * directory lives elsewhere (`--separate-git-dir`) has no root to derive, and
+ * a `.git` file that is itself a separate git directory is not a worktree.
+ * @param {string} gitFile - path of the `.git` file.
+ * @returns {Promise<string | undefined>} the main repository root, or undefined when none can be derived.
+ */
+export async function mainRootOfWorktree(gitFile) {
+  const gitdir = await gitdirOf(gitFile)
+  if (gitdir === undefined) return undefined
+  const commondirText = await readOrAbsent(join(gitdir, 'commondir'))
+  if (commondirText === undefined) return undefined
+  const raw = commondirText.trim()
+  const common = isAbsolute(raw) ? raw : resolve(gitdir, raw)
+  if (common === gitdir) return undefined
+  return common.endsWith(`${sep}.git`) ? dirname(common) : undefined
 }
 
 /**
  * Project roots whose Claude Code memory may belong to `cwd`, most specific
  * first: the enclosing repository (a linked worktree's own path first, then
- * its main repository), then `cwd` itself for directories outside git.
+ * its main repository), then `cwd` itself for directories outside git. The
+ * path is tried as given and as its real path, so a session entered through
+ * a symbolic link still finds the repository behind it.
  * @param {string} cwd - absolute session working directory.
  * @returns {Promise<string[]>} distinct absolute candidates in lookup order.
  */
 export async function projectRoots(cwd) {
-  const roots = []
-  const git = await findGitEntry(cwd)
-  if (git !== undefined) {
-    roots.push(git.root)
-    if (git.isFile) {
-      const main = await mainRootOfWorktree(git.path)
-      if (main !== undefined) roots.push(main)
-    }
+  const given = resolve(cwd)
+  let real
+  try {
+    real = await realpath(given)
+  } catch (error) {
+    if (!isAbsence(error)) throw error
+    real = given
   }
-  roots.push(resolve(cwd))
+  const roots = []
+  for (const start of new Set([given, real])) {
+    const git = await findGitEntry(start)
+    if (git !== undefined) {
+      roots.push(git.root)
+      if (git.isFile) {
+        const main = await mainRootOfWorktree(git.path)
+        if (main !== undefined) roots.push(main)
+      }
+    }
+    roots.push(start)
+  }
   return [...new Set(roots)]
 }
 
@@ -111,14 +160,8 @@ export async function projectRoots(cwd) {
 export async function locateMemoryIndex(cwd, claudeHome) {
   for (const root of await projectRoots(cwd)) {
     const path = join(claudeHome, 'projects', slugOf(root), 'memory', 'MEMORY.md')
-    let info
-    try {
-      info = await stat(path)
-    } catch (error) {
-      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') continue
-      throw error
-    }
-    if (info.isFile()) return { root, path, size: info.size, mtimeMs: info.mtimeMs }
+    const info = await statOrAbsent(path)
+    if (info?.isFile()) return { root, path, size: info.size, mtimeMs: info.mtimeMs }
   }
   return undefined
 }
@@ -216,7 +259,7 @@ export function renderIndexMessage({ path, text, truncated }) {
     : ''
   return [
     '<system-reminder>',
-    `Contents of ${path} (Claude Code's persistent memory index for this project; dsh-claude-memory loads it at the start of each conversation). Each line names one memory file in ${dir}. Read a memory file with a shell \`cat\` only when the current task relates to it; never read them all at once. Claude Code maintains these files: do not create, edit, or delete them, and do not copy their contents into the repository.${note}`,
+    `Contents of ${path} (Claude Code's persistent memory index for this project; dsh-claude-memory loads it at the start of each conversation). This is the complete current index and replaces any memory index shown earlier in this conversation: an entry missing here no longer exists. Each line names one memory file in ${dir}. Read a memory file with a shell \`cat\` only when the current task relates to it; never read them all at once. Claude Code maintains these files: do not create, edit, or delete them, and do not copy their contents into the repository.${note}`,
     '',
     text.trimEnd(),
     '</system-reminder>',

@@ -99,6 +99,12 @@ const EMPTY_STATE = Object.freeze({ seq: null, digest: null, path: null })
 
 /**
  * Pure fold: the newest snapshot of this plugin still on the surface.
+ *
+ * A surface replacement names every node it shadows in `sourceEventSeqs`
+ * (the host requires that of a `replace` op), and that list is what decides
+ * whether the snapshot left the surface: surface order is not seq order, so
+ * the `startSeq..endSeq` range alone cannot say which nodes it spanned. The
+ * range is consulted only when a replacement carries no source list.
  * @param {{ seq: number | null, digest: string | null, path: string | null }} state - prior state.
  * @param {object} event - committed session event.
  * @returns {{ seq: number | null, digest: string | null, path: string | null }} next state (same reference when unchanged).
@@ -110,11 +116,13 @@ export function applyProjection(state, event) {
       return { seq: event.seq, digest: typeof source.digest === 'string' ? source.digest : null, path: typeof source.path === 'string' ? source.path : null }
     }
   }
+  if (state.seq === null) return state
   const op = event.surfaceOp
-  if (state.seq !== null && op !== undefined && op !== 'append' && op.op === 'replace' && op.startSeq <= state.seq && state.seq <= op.endSeq) {
-    return EMPTY_STATE
-  }
-  return state
+  if (op === undefined || op === 'append' || op.op !== 'replace') return state
+  const shadowed = Array.isArray(event.sourceEventSeqs)
+    ? event.sourceEventSeqs.includes(state.seq)
+    : op.startSeq <= state.seq && state.seq <= op.endSeq
+  return shadowed ? EMPTY_STATE : state
 }
 
 /**
@@ -132,7 +140,7 @@ export function apply(ctx, config) {
 
   ctx.sessionProjections.register({
     key: PROJECTION_KEY,
-    stateVersion: 1,
+    stateVersion: 2,
     stateSchema: projectionStateSchema,
     init: () => EMPTY_STATE,
     apply: applyProjection,

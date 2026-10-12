@@ -39,6 +39,7 @@ function mount(config = {}) {
   }
   apply(ctx, Config(config))
   assert.equal(definition.key, PROJECTION_KEY)
+  assert.equal(definition.stateVersion, 2)
   const commit = (session, event) => {
     const prior = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
     states.set(session, definition.apply(prior, event))
@@ -107,7 +108,11 @@ test('projection fold records this plugin snapshots, ignores other events, and c
   const outside = { type: 'user/message', seq: 5, surfaceOp: { op: 'replace', startSeq: 3, endSeq: 4 }, data: userMessage('c') }
   assert.equal(applyProjection(seen, outside), seen)
   const covering = { type: 'user/message', seq: 6, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 5 }, data: userMessage('c') }
-  assert.deepEqual(applyProjection(seen, covering), empty)
+  assert.deepEqual(applyProjection(seen, covering), empty, 'range decides when no source list is carried')
+  const listed = { type: 'user/message', seq: 6, surfaceOp: { op: 'replace', startSeq: 3, endSeq: 1 }, sourceEventSeqs: [3, 1, 2], data: userMessage('c') }
+  assert.deepEqual(applyProjection(seen, listed), empty, 'the source list decides regardless of the numeric range')
+  const unlisted = { type: 'user/message', seq: 6, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 5 }, sourceEventSeqs: [1, 3, 4, 5], data: userMessage('c') }
+  assert.equal(applyProjection(seen, unlisted), seen, 'a replacement that does not name the snapshot leaves it visible')
   const notice = { type: 'user/message', seq: 7, surfaceOp: 'append', data: { source: { kind: SOURCE_KIND, form: 'notice', summary: 's' } } }
   assert.equal(applyProjection(seen, notice), seen)
 })
