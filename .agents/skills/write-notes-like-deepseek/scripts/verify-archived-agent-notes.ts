@@ -9,7 +9,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { agentNoteRoot } from "./agent-note-tree.ts";
 
 const isWrite = process.argv.includes("--write");
@@ -79,9 +79,11 @@ for (const key of Object.keys(manifest.files)) {
 }
 
 // --- append-only vs git baseline (skipped without git)
+// The notes root may not exist yet; ask git from its nearest existing ancestor so a fresh host is not misreported as "not a git repository".
+const gitCwd = (() => { let dir = agentNoteRoot; while (!existsSync(dir) && dirname(dir) !== dir) dir = dirname(dir); return dir; })();
 const repoRoot = (() => {
   try {
-    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: agentNoteRoot, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: gitCwd, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
   } catch {
     return null;
   }

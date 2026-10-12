@@ -17,13 +17,13 @@
       "source": "rayseling/write-notes-like-deepseek",
       "sourceType": "github",
       "skillPath": "skills/dsh-gate-every-rule/SKILL.md",
-      "computedHash": "9117f8195c086f7e6078c9884915ca405977972e7b9b840706a43ee156aacc50"
+      "computedHash": "4e886bf856798d26616d24c83686ca1bd09ecc79be4f4f2dc09a4b7d9f4ca18c"
     },
     "dsh-layer-instructions": {
       "source": "rayseling/write-notes-like-deepseek",
       "sourceType": "github",
       "skillPath": "skills/dsh-layer-instructions/SKILL.md",
-      "computedHash": "b9ad4cf9ea6112cf3ab34ca8fa05e9d531d9fce6f8e2de4efca0a4182afda70c"
+      "computedHash": "692a16effe70afafa9c17802d7e4e970767653b521628b92ec326ab205cd2d9f"
     },
     "dsh-pre-push-checks": {
       "source": "rayseling/write-notes-like-deepseek",
@@ -47,7 +47,7 @@
       "source": "rayseling/write-notes-like-deepseek",
       "sourceType": "github",
       "skillPath": "skills/write-notes-like-deepseek/SKILL.md",
-      "computedHash": "53c9ed23c5e39286a3e2ef69f934f48b57574a895f61ce792741563d3f3e3b28"
+      "computedHash": "9a9855f80ccadf209edd7ae7cbf0129368fcc151e0e90ff7d3c5092b4af7b491"
     }
   }
 }

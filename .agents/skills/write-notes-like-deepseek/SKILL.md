@@ -162,7 +162,7 @@ npm run init-board                 # 生成 ~69KB 轻量看板 board.html（日�
 npm run bundle-board               # 打包内嵌全量数据的自包含 demo.html
 ```
 
-脚本位于本 Skill 的 `scripts/`，从**宿主项目根目录**调用，默认检查当前目录下的 `.agents/notes/`。先根据已加载的 `SKILL.md` 路径确定 Skill 位置，不要假定宿主根目录存在 `scripts/`，也不要切换到 Skill 目录执行。安装不会自动配置宿主的 npm scripts。
+脚本位于本 Skill 的 `scripts/`，从**宿主项目根目录**调用，默认检查当前目录下的 `.agents/notes/`。宿主已有别的笔记目录（如 `notes/`）时设 `AGENT_NOTE_ROOT=notes` 指过去，目录结构仍须是 `{lifecycle}/{class}/`。根目录下与生命周期无关的旧文件夹（如 `notes/postmortems/`）默认会被树校验当作未知生命周期而报错；要保留它们，用 `AGENT_NOTE_IGNORE=postmortems`（逗号分隔）显式点名，被点名的文件夹完全不校验。先根据已加载的 `SKILL.md` 路径确定 Skill 位置，不要假定宿主根目录存在 `scripts/`，也不要切换到 Skill 目录执行。安装不会自动配置宿主的 npm scripts。
 
 项目级安装到 `.agents/skills/` 时，可直接执行：
 

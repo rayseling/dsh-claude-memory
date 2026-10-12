@@ -35,6 +35,8 @@ npx tsx .agents/skills/dsh-gate-every-rule/scripts/verify-md-links.ts [dir...]
 npx tsx .agents/skills/dsh-gate-every-rule/scripts/verify-escape-hatch-baseline.ts [--init|--prune]
 ```
 
+Node ≥ 23.6 可以把所有命令里的 `npx tsx` 换成 `node`（原生类型剥离，脚本只用可擦除语法）：每条门从 ~1 s 降到 0.1 s，且不依赖 npx——宿主的 `node_modules` 是指向别处的符号链接时 `npx tsx` 会报 `tsx: command not found`，`node` 不受影响。`.agents/gates.json` 里的命令照此替换即可。
+
 ## 只减不增基线
 
 逃生口每处单看都"有理由"，累计起来类型系统形同虚设；一刀禁又清不掉存量。DSH 的做法：记录当前数量作基线，门禁只允许持平或下降。

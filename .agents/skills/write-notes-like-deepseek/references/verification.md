@@ -31,4 +31,6 @@
 
 ## 脚本路径
 
+所有脚本读 `AGENT_NOTE_ROOT`（默认 `.agents/notes`）决定笔记根目录；`AGENT_NOTE_IGNORE` 点名根目录下不校验的旧文件夹（逗号分隔，默认空，未点名的未知文件夹报错）；`AGENT_NOTE_ARCHIVE_BASE_REF` 决定封印的对比基线。
+
 本文的 `scripts/` 相对于 Skill 安装目录。运行命令时保持当前目录为宿主项目根目录，并使用实际 Skill 路径调用脚本；安装本身不会创建宿主 npm scripts。
