@@ -1,18 +1,19 @@
 /**
- * Pure helpers: where Claude Code keeps a project's memory, and how its index
- * is bounded and framed for the model. Nothing here touches the harness, so
- * `node --test` covers it without a profile.
+ * Pure helpers: where Claude Code keeps a project's memory, how its index is
+ * read within bounds, and how it is framed for the model. Nothing here
+ * touches the harness, so `node --test` covers it without a profile.
  *
  * Claude Code stores auto memory under `<claudeHome>/projects/<slug>/memory/`,
  * where `<slug>` is the project path with every character outside
  * `[A-Za-z0-9]` replaced by `-`. The project is the git repository root when
  * there is one, else the working directory. The index `MEMORY.md` is loaded
- * up to its first 200 lines or 25 KB, whichever comes first; topic files are
- * read on demand.
+ * up to its first 200 lines or 25,000 UTF-16 code units (the documentation
+ * says "25KB"; anthropics/claude-code#97453 measured code units), whichever
+ * comes first, cut at a line end. Topic files are read on demand.
  * @module dsh-claude-memory/locate
  */
 
-import { readFileSync, statSync } from 'node:fs'
+import { open, readFile, stat } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 /**
@@ -26,11 +27,11 @@ export function slugOf(path) {
 
 /**
  * @param {string} path
- * @returns {import('node:fs').Stats | undefined} stats, or undefined when the path is absent or unreadable.
+ * @returns {Promise<import('node:fs').Stats | undefined>} stats, or undefined when the path is absent or unreadable.
  */
-function statOrUndefined(path) {
+async function statOrUndefined(path) {
   try {
-    return statSync(path)
+    return await stat(path)
   } catch {
     // ENOENT, ENOTDIR, EACCES all mean "not a usable entry" here.
     return undefined
@@ -40,14 +41,14 @@ function statOrUndefined(path) {
 /**
  * Nearest ancestor of `start` (inclusive) holding a `.git` entry.
  * @param {string} start - absolute directory to walk up from.
- * @returns {{ root: string, isFile: boolean, path: string } | undefined} the repository
- *   root, whether `.git` is a file (linked worktree) or a directory, and the entry path.
+ * @returns {Promise<{ root: string, isFile: boolean, path: string } | undefined>} the
+ *   repository root, whether `.git` is a file (linked worktree) or a directory, and the entry path.
  */
-export function findGitEntry(start) {
+export async function findGitEntry(start) {
   let dir = resolve(start)
   for (;;) {
     const candidate = join(dir, '.git')
-    const info = statOrUndefined(candidate)
+    const info = await statOrUndefined(candidate)
     if (info !== undefined) return { root: dir, isFile: info.isFile(), path: candidate }
     const parent = dirname(dir)
     if (parent === dir) return undefined
@@ -58,12 +59,12 @@ export function findGitEntry(start) {
 /**
  * Main repository root recorded by a linked worktree's `.git` file.
  * @param {string} gitFile - path of the `.git` file (`gitdir: <main>/.git/worktrees/<name>`).
- * @returns {string | undefined} `<main>`, or undefined when the file does not name a worktree gitdir.
+ * @returns {Promise<string | undefined>} `<main>`, or undefined when the file does not name a worktree gitdir.
  */
-export function mainRootOfWorktree(gitFile) {
+export async function mainRootOfWorktree(gitFile) {
   let text
   try {
-    text = readFileSync(gitFile, 'utf8')
+    text = await readFile(gitFile, 'utf8')
   } catch {
     // An unreadable `.git` file yields no main root; the worktree path itself still applies.
     return undefined
@@ -82,15 +83,15 @@ export function mainRootOfWorktree(gitFile) {
  * first: the enclosing repository (a linked worktree's own path first, then
  * its main repository), then `cwd` itself for directories outside git.
  * @param {string} cwd - absolute session working directory.
- * @returns {string[]} distinct absolute candidates in lookup order.
+ * @returns {Promise<string[]>} distinct absolute candidates in lookup order.
  */
-export function projectRoots(cwd) {
+export async function projectRoots(cwd) {
   const roots = []
-  const git = findGitEntry(cwd)
+  const git = await findGitEntry(cwd)
   if (git !== undefined) {
     roots.push(git.root)
     if (git.isFile) {
-      const main = mainRootOfWorktree(git.path)
+      const main = await mainRootOfWorktree(git.path)
       if (main !== undefined) roots.push(main)
     }
   }
@@ -102,53 +103,123 @@ export function projectRoots(cwd) {
  * Locate the Claude Code memory index that applies to a working directory.
  * @param {string} cwd - absolute session working directory.
  * @param {string} claudeHome - Claude Code configuration directory (normally `~/.claude`).
- * @returns {{ root: string, path: string } | undefined} the matched project root and the
- *   `MEMORY.md` path, or undefined when no candidate has one.
+ * @returns {Promise<{ root: string, path: string, size: number, mtimeMs: number } | undefined>} the
+ *   matched project root, the `MEMORY.md` path and its current size and mtime, or undefined when no candidate has one.
  */
-export function locateMemoryIndex(cwd, claudeHome) {
-  for (const root of projectRoots(cwd)) {
+export async function locateMemoryIndex(cwd, claudeHome) {
+  for (const root of await projectRoots(cwd)) {
     const path = join(claudeHome, 'projects', slugOf(root), 'memory', 'MEMORY.md')
-    if (statOrUndefined(path)?.isFile()) return { root, path }
+    const info = await statOrUndefined(path)
+    if (info?.isFile()) return { root, path, size: info.size, mtimeMs: info.mtimeMs }
   }
   return undefined
 }
 
 /**
- * Bound the index the way Claude Code does: the first `maxLines` lines or the
- * first `maxBytes` bytes, whichever comes first, cut back to a whole line.
- * @param {string} text - full `MEMORY.md` content.
- * @param {{ maxLines: number, maxBytes: number }} limits - positive integer caps.
- * @returns {{ text: string, truncated: boolean, totalLines: number }} the bounded text.
+ * Decode the longest prefix of `buffer` that is complete UTF-8, dropping at
+ * most the three bytes of one unfinished trailing sequence.
+ * @param {Buffer} buffer - bytes read from the file.
+ * @returns {string} the decoded prefix.
  */
-export function truncateIndex(text, { maxLines, maxBytes }) {
+export function decodeCompletePrefix(buffer) {
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  for (let end = buffer.length; end >= 0 && end >= buffer.length - 3; end -= 1) {
+    try {
+      return decoder.decode(buffer.subarray(0, end))
+    } catch {
+      // The tail splits a multibyte sequence; drop one more byte.
+    }
+  }
+  return new TextDecoder('utf-8').decode(buffer)
+}
+
+/**
+ * Bound an index the way Claude Code does: the first `maxLines` lines or the
+ * first `maxChars` UTF-16 code units, whichever comes first. A cut lands on
+ * the last line end before the limit when there is one; otherwise the first
+ * line's longest prefix that does not split a surrogate pair.
+ * @param {string} text - index content, possibly already a prefix of the file.
+ * @param {{ maxLines: number, maxChars: number }} limits - positive integer caps.
+ * @returns {{ text: string, truncated: boolean }} the bounded text and whether anything was cut.
+ */
+export function truncateIndex(text, { maxLines, maxChars }) {
   const lines = text.split('\n')
   const kept = lines.length > maxLines ? lines.slice(0, maxLines) : lines
   let out = kept.join('\n')
   let truncated = kept.length < lines.length
-  if (Buffer.byteLength(out, 'utf8') > maxBytes) {
-    out = Buffer.from(out, 'utf8').subarray(0, maxBytes).toString('utf8')
+  if (out.length > maxChars) {
+    out = out.slice(0, maxChars)
     const newline = out.lastIndexOf('\n')
-    if (newline > 0) out = out.slice(0, newline)
+    if (newline > 0) {
+      out = out.slice(0, newline)
+    } else {
+      const last = out.charCodeAt(out.length - 1)
+      if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1)
+    }
     truncated = true
   }
-  return { text: out, truncated, totalLines: lines.length }
+  return { text: out, truncated }
+}
+
+/**
+ * Read a bounded prefix of the index and apply {@link truncateIndex}. At most
+ * `3 * maxChars + 1` bytes leave the disk, which is enough to decide every
+ * code-unit cut (a code unit never needs more than three UTF-8 bytes).
+ * @param {string} path - `MEMORY.md` path.
+ * @param {{ maxLines: number, maxChars: number }} limits - positive integer caps.
+ * @returns {Promise<{ text: string, truncated: boolean }>} the bounded text; `truncated` is also true when the file continued past the read window.
+ */
+export async function readIndex(path, limits) {
+  const budget = 3 * limits.maxChars + 1
+  const handle = await open(path, 'r')
+  let buffer
+  try {
+    buffer = Buffer.alloc(budget)
+    const { bytesRead } = await handle.read(buffer, 0, budget, 0)
+    buffer = buffer.subarray(0, bytesRead)
+  } finally {
+    await handle.close()
+  }
+  const partial = buffer.length === budget
+  const decoded = partial ? decodeCompletePrefix(buffer) : buffer.toString('utf8')
+  const bounded = truncateIndex(decoded, limits)
+  // A window that stops mid-file cannot vouch for its last line.
+  if (partial && !bounded.truncated) {
+    const newline = bounded.text.lastIndexOf('\n')
+    return { text: newline > 0 ? bounded.text.slice(0, newline) : bounded.text, truncated: true }
+  }
+  return bounded
 }
 
 /**
  * Frame the bounded index as the model-facing message.
- * @param {{ path: string, text: string, truncated: boolean, totalLines: number }} index - located and bounded index.
+ * @param {{ path: string, text: string, truncated: boolean }} index - located and bounded index.
  * @returns {string} the complete `<system-reminder>` block.
  */
-export function renderIndexMessage({ path, text, truncated, totalLines }) {
+export function renderIndexMessage({ path, text, truncated }) {
   const dir = dirname(path)
   const note = truncated
-    ? ` Only the first part of the index is shown; the file has ${totalLines} lines, read it directly for the rest.`
+    ? ' Only the beginning of the index is shown; read the file directly for the rest.'
     : ''
   return [
     '<system-reminder>',
     `Contents of ${path} (Claude Code's persistent memory index for this project; dsh-claude-memory loads it at the start of each conversation). Each line names one memory file in ${dir}. Read a memory file with a shell \`cat\` only when the current task relates to it; never read them all at once. Claude Code maintains these files: do not create, edit, or delete them, and do not copy their contents into the repository.${note}`,
     '',
     text.trimEnd(),
+    '</system-reminder>',
+  ].join('\n')
+}
+
+/**
+ * Frame the withdrawal that replaces an index the model has seen after the
+ * file disappeared or became blank.
+ * @param {string} path - the `MEMORY.md` path shown earlier.
+ * @returns {string} the complete `<system-reminder>` block.
+ */
+export function renderWithdrawnMessage(path) {
+  return [
+    '<system-reminder>',
+    `The Claude Code memory index shown earlier for this project (${path}) is no longer available: the file is missing or empty. Treat that earlier index as withdrawn and do not rely on it.`,
     '</system-reminder>',
   ].join('\n')
 }
