@@ -10,6 +10,7 @@ Gives a DeepSeek Harness session the Claude Code auto-memory of the project it w
 - 索引按 Claude Code 的上限截断:前 200 行或前 25,000 个 UTF-16 code unit(文档写 "25KB",anthropics/claude-code#97453 实测为 code unit,维护者未确认),先到为准。截点回退到最后一个行尾;首行就超限时给该行不劈代理对的前缀。磁盘上最多只读 `3 × maxChars + 1` 字节。
 - 以 `user` 角色、来源 `plugin:claude-memory`(form `snapshot`)的消息进入会话,位置紧跟本轮用户消息之后。它是普通的 `user/message` 会话事件,随日志重放、压缩、续聊;模型可见的内容都能从日志重建。
 - 一个会话投影(`claudeMemory`)记录本插件最新一条仍在 surface 上的 snapshot 及其内容摘要,由已提交事件维护、续聊时恢复;一条 surface 替换事件在 `sourceEventSeqs` 里点名了这条 snapshot 时清空(surface 顺序不是 seq 顺序,不能按 seq 区间猜)。宿主不会因为新 snapshot 把旧消息从模型上下文里拿走,所以注入文本明确声明"本索引完整替代此前展示过的索引"。摘要相同就不注入;索引变了就以新 snapshot 进入;索引在展示过之后消失或变空,进入一条撤回 snapshot。文件的 size/mtime 没变就复用上次渲染,不重新读盘(`touch -r` 式保留 mtime 的原地改写不会被发现)。读失败或 stat 失败(权限、I/O)只记一次警告、什么都不注入,绝不当作记忆已撤回;撤回只在文件确实不存在或内容为空时进入。
+- Web 斜杠命令 `/memory on|off|status` 与模型选择旁的 Claude Code 记忆 pill 都能按会话开关:关闭后不再加载或更新索引,普通续聊保持,已注入索引不删除。
 - 条目文件不预加载。注入文本告诉模型:只在任务相关时用 shell `cat` 读对应文件,不要全读;这些文件由 Claude Code 维护,只读不改。
 - 子代理会话默认不注入(Claude Code 也不给子代理记忆)。会话 header 没有记录工作目录时也不注入,绝不退回到 dsh 进程自己的目录。
 
@@ -40,7 +41,8 @@ pnpm add link:/path/to/dsh-claude-memory
 
 ## 升级注意
 
-- 0.2.0 起配置键 `maxBytes` 改为 `maxChars`(口径从字节改为 UTF-16 code unit)。schemastery 不会拒绝未知键,旧的 `maxBytes` 会被静默忽略,请改名。
+- 0.2.0 起 `maxBytes` 改名 `maxChars`(字节改为 UTF-16 code unit);旧键会被静默忽略,请改名。
+- 0.3.0 起 `/memory` 需要宿主提供 `appendPluginRecord`;旧版只警告并继续注入。
 
 ## 开发
 

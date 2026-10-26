@@ -3,21 +3,54 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Config, PROJECTION_KEY, SOURCE_KIND, apply, applyProjection, inject, name, projectionStateSchema } from '../src/index.js'
+import { Context } from '@deepseek-ai/cordis'
+import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import CommandRuntime from '@deepseek-ai/dsh-commands'
+import {
+  COMMAND_DEFINITION_ID,
+  COMMAND_NAME,
+  Config,
+  MODE_EVENT_TYPE,
+  MODE_PROJECTION_KEY,
+  PROJECTION_KEY,
+  SOURCE_KIND,
+  apply,
+  applyModeProjection,
+  applyProjection,
+  inject,
+  modeStateSchema,
+  name,
+  parseMemoryCommand,
+  projectionStateSchema,
+} from '../src/index.js'
 import { slugOf } from '../src/locate.js'
 
 const scratch = () => realpathSync(mkdtempSync(join(tmpdir(), 'dsh-claude-memory-plugin-')))
 
+let sessionCounter = 0
+
+/** A real Session so `appendPluginRecord` can commit the mode record. */
+async function newRealSession() {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  return ctx.sessions.create(SessionId(`memory-command-${++sessionCounter}`))
+}
+
+/** The latest mode record the command appended to a real session. */
+const lastModeEvent = (session) => session.snapshotEvents().filter((event) => event.type === MODE_EVENT_TYPE).at(-1)
+
 /**
  * Mount the plugin against a recording context whose projection registry
  * folds committed events exactly as the host does, and return the pre-step
- * listener plus helpers that commit messages to a fake session.
+ * listener plus helpers that commit events to a fake session.
  */
-function mount(config = {}) {
+function mount(config = {}, { withCommands = false, commandError = undefined } = {}) {
   const logs = []
   let listener
-  let definition
+  const definitions = new Map()
   const states = new WeakMap()
+  const commands = []
   const ctx = {
     logger: { info: (line) => logs.push(['info', line]), warn: (line) => logs.push(['warn', line]) },
     on(event, handler) {
@@ -25,26 +58,49 @@ function mount(config = {}) {
       listener = handler
       return () => {}
     },
+    inject(deps, callback) {
+      if (!withCommands || !deps.includes('commands')) return
+      callback({
+        commands: {
+          register(definition) {
+            if (commandError !== undefined) throw commandError
+            commands.push(definition)
+            return () => {}
+          },
+        },
+      })
+    },
     sessionProjections: {
-      register(def) {
-        definition = def
+      register(definition) {
+        definitions.set(definition.key, definition)
         return () => {}
       },
       stateOf(session, key) {
-        assert.equal(key, PROJECTION_KEY)
-        if (!states.has(session)) states.set(session, definition.init(session.header, 0))
-        return states.get(session)
+        const definition = definitions.get(key)
+        if (definition === undefined) return undefined
+        let byKey = states.get(session)
+        if (byKey === undefined) states.set(session, byKey = new Map())
+        if (!byKey.has(key)) byKey.set(key, definition.init(session.header, 0))
+        return byKey.get(key)
       },
     },
   }
   apply(ctx, Config(config))
+  const definition = definitions.get(PROJECTION_KEY)
+  const modeDefinition = definitions.get(MODE_PROJECTION_KEY)
   assert.equal(definition.key, PROJECTION_KEY)
   assert.equal(definition.stateVersion, 2)
+  assert.equal(modeDefinition.key, MODE_PROJECTION_KEY)
+  assert.equal(modeDefinition.stateVersion, 1)
+  assert.deepEqual(modeDefinition.wire.view({ enabled: false }), { enabled: false })
+  assert.deepEqual(modeDefinition.wire.viewSchema.parse({ enabled: false }), { enabled: false })
   const commit = (session, event) => {
-    const prior = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
-    states.set(session, definition.apply(prior, event))
+    for (const [key, unit] of definitions) {
+      const prior = ctx.sessionProjections.stateOf(session, key)
+      states.get(session).set(key, unit.apply(prior, event))
+    }
   }
-  return { listener, logs, commit, definition }
+  return { listener, logs, commit, definition, modeDefinition, commands, ctx }
 }
 
 const userMessage = (text) => ({ id: `u-${text}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
@@ -78,6 +134,8 @@ test('exports the plugin identity', () => {
   assert.equal(name, 'claude-memory')
   assert.deepEqual(inject, ['sessionProjections'])
   assert.equal(SOURCE_KIND, 'plugin:claude-memory')
+  assert.equal(MODE_PROJECTION_KEY, 'claudeMemoryMode')
+  assert.equal(COMMAND_NAME, 'memory')
 })
 
 test('Config applies Claude Code defaults and validates caps', () => {
@@ -115,6 +173,108 @@ test('projection fold records this plugin snapshots, ignores other events, and c
   assert.equal(applyProjection(seen, unlisted), seen, 'a replacement that does not name the snapshot leaves it visible')
   const notice = { type: 'user/message', seq: 7, surfaceOp: 'append', data: { source: { kind: SOURCE_KIND, form: 'notice', summary: 's' } } }
   assert.equal(applyProjection(seen, notice), seen)
+})
+
+test('mode state schema accepts only the on/off shape', () => {
+  assert.deepEqual(modeStateSchema.parse({ enabled: false, extra: 1 }), { enabled: false })
+  assert.deepEqual(modeStateSchema.parse({ enabled: true }), { enabled: true })
+  assert.throws(() => modeStateSchema.parse({ enabled: 'yes' }))
+  assert.throws(() => modeStateSchema.parse({}))
+  assert.throws(() => modeStateSchema.parse(null))
+})
+
+test('parses the /memory argument grammar', () => {
+  assert.equal(parseMemoryCommand(''), 'status')
+  assert.equal(parseMemoryCommand('  '), 'status')
+  assert.equal(parseMemoryCommand(' off '), 'off')
+  assert.equal(parseMemoryCommand('ON'), 'on')
+  assert.equal(parseMemoryCommand('status'), 'status')
+  assert.equal(parseMemoryCommand('bogus'), undefined)
+  assert.equal(parseMemoryCommand('off always'), undefined)
+})
+
+test('mode projection folds only switch events and ignores surface replacements', () => {
+  const on = { enabled: true }
+  assert.equal(applyModeProjection(on, { type: 'command/run', data: { name: COMMAND_NAME, args: 'off' } }), on)
+  const off = applyModeProjection(on, { type: MODE_EVENT_TYPE, data: { enabled: false } })
+  assert.deepEqual(off, { enabled: false })
+  assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: { enabled: false } }), off)
+  assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: {} }), off)
+  assert.equal(applyModeProjection(off, { type: 'user/message', surfaceOp: { op: 'replace', startSeq: 1, endSeq: 9 }, data: userMessage('x') }), off)
+})
+
+test('registers /memory only when a command surface is composed', () => {
+  const without = mount()
+  assert.equal(without.commands.length, 0)
+  const withCommands = mount({}, { withCommands: true })
+  assert.equal(withCommands.commands.length, 1)
+  const command = withCommands.commands[0]
+  assert.equal(command.name, COMMAND_NAME)
+  assert.equal(command.definitionId, COMMAND_DEFINITION_ID)
+  assert.equal(command.input.hint, 'on|off|status')
+})
+
+test('a command registration failure is logged and leaves injection working', async () => {
+  const { home, project } = seedProject()
+  const { listener, logs } = mount(
+    { claudeHome: home },
+    { withCommands: true, commandError: new Error('duplicate command name') },
+  )
+  assert.deepEqual(logs.map(([level]) => level), ['warn'])
+  assert.match(logs[0][1], /cannot register \/memory: duplicate command name/)
+  assert.equal((await run(listener, { agent: fakeAgent({ cwd: project }) })).messages.length, 2)
+})
+
+test('the /memory command appends the switch and reports state', async () => {
+  const { commands, commit, ctx } = mount({}, { withCommands: true })
+  const command = commands[0]
+  const session = await newRealSession()
+  const agent = { session }
+  const off = command.handler({ agent, rawInput: 'off' })
+  assert.equal(off.kind, 'success')
+  assert.equal(off.text, 'Claude Code memory off')
+  assert.ok(Number.isInteger(off.sourceEventSeq))
+  commit(session, lastModeEvent(session))
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: false })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Claude Code memory is already off' })
+  const on = command.handler({ agent, rawInput: 'on' })
+  assert.equal(on.kind, 'success')
+  assert.equal(on.text, 'Claude Code memory on')
+  assert.ok(Number.isInteger(on.sourceEventSeq))
+  commit(session, lastModeEvent(session))
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
+  assert.deepEqual(command.handler({ agent, rawInput: 'bogus' }), { kind: 'error', text: 'usage: /memory on|off|status' })
+})
+
+test('a throwing switch append leaves the mode unchanged and reports an error', () => {
+  const { commands, logs, ctx } = mount({}, { withCommands: true })
+  const command = commands[0]
+  const session = { id: 'session-test', header: {} }
+  const result = command.handler({ agent: { session }, rawInput: 'off' })
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /session log rejected/)
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
+  assert.match(logs.at(-1)[1], /cannot store the memory switch/)
+})
+
+test('the real projection service restores the switch from the committed log', async () => {
+  const ctx = new Context()
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  await ctx.plugin(CommandRuntime)
+  apply(ctx, Config({}))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const session = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`))
+  const agent = { id: session.id, session }
+  const execution = await ctx.commands.execute(agent, '/memory off', [], new AbortController().signal)
+  assert.ok(execution)
+  assert.equal(execution.result.kind, 'success')
+  assert.ok(Number.isInteger(execution.result.sourceEventSeq))
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: false })
+  assert.ok(session.snapshotEvents().some((event) => event.type === MODE_EVENT_TYPE && event.ignorable === true))
+  const restored = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`), { seed: session.snapshotEvents() })
+  assert.deepEqual(ctx.sessionProjections.stateOf(restored, MODE_PROJECTION_KEY), { enabled: false })
 })
 
 test('enters the index right after the claimed batch, with a sourced snapshot', async () => {
@@ -163,6 +323,78 @@ test('does not enter the index twice while the visible snapshot is current, re-e
   const after = await run(listener, { agent })
   assert.equal(after.messages.length, 2, 'snapshot shadowed by compaction is entered again')
   assert.equal(after.messages[1].source.digest, changed.messages[1].source.digest)
+})
+
+test('turning the switch off suppresses injection and refresh until it is turned back on', async () => {
+  const { home, project, path } = seedProject('- one\n')
+  const { listener, commit } = mount({ claudeHome: home })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.equal(first.messages.length, 2)
+  commitAll(commit, agent.session, first, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { enabled: false } })
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'off: no injection')
+  writeFileSync(path, '- two\n')
+  utimesSync(path, new Date(Date.now() + 5000), new Date(Date.now() + 5000))
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'off: no refresh')
+  commit(agent.session, { type: 'user/message', seq: 11, surfaceOp: { op: 'replace', startSeq: 1, endSeq: 10 }, data: userMessage('compacted') })
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'off survives a covering replace')
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 12, data: { enabled: true } })
+  const on = await run(listener, { agent })
+  assert.equal(on.messages.length, 2)
+  assert.ok(on.messages[1].content[0].text.includes('- two'))
+})
+
+test('turning the switch off before the first turn enters nothing', async () => {
+  const { home, project } = seedProject()
+  const { listener, commit } = mount({ claudeHome: home })
+  const agent = fakeAgent({ cwd: project })
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 1, data: { enabled: false } })
+  assert.equal((await run(listener, { agent })).messages.length, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 2, data: { enabled: true } })
+  assert.equal((await run(listener, { agent })).messages.length, 2)
+})
+
+test('re-enabling with an unchanged index does not re-enter it', async () => {
+  const { home, project } = seedProject('- one\n')
+  const { listener, commit } = mount({ claudeHome: home })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  commitAll(commit, agent.session, first, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { enabled: false } })
+  assert.equal((await run(listener, { agent })).messages.length, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 11, data: { enabled: true } })
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'the shown index is still current')
+})
+
+test('re-enabling after the index disappears withdraws it', async () => {
+  const { home, project, path } = seedProject('- one\n')
+  const { listener, commit } = mount({ claudeHome: home })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  commitAll(commit, agent.session, first, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { enabled: false } })
+  rmSync(path)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 11, data: { enabled: true } })
+  const on = await run(listener, { agent })
+  assert.equal(on.messages.length, 2)
+  assert.ok(on.messages[1].content[0].text.includes('no longer available'))
+})
+
+test('a switch that lands after the initial check suppresses the injection', async () => {
+  const { home, project } = seedProject()
+  const { listener, ctx } = mount({ claudeHome: home })
+  const agent = fakeAgent({ cwd: project })
+  const original = ctx.sessionProjections.stateOf
+  let modeReads = 0
+  ctx.sessionProjections.stateOf = (session, key) => {
+    if (key === MODE_PROJECTION_KEY) {
+      modeReads += 1
+      if (modeReads === 2) return { enabled: false }
+    }
+    return original(session, key)
+  }
+  assert.equal((await run(listener, { agent })).messages.length, 1)
 })
 
 test('a snapshot already in the batch is not duplicated', async () => {

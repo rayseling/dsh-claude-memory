@@ -18,6 +18,14 @@
  * enters as a newer snapshot; an index that disappeared after being shown
  * enters a withdrawal snapshot.
  *
+ * A second projection (`claudeMemoryMode`) holds the per-session on/off
+ * switch. The `/memory` command appends one ignorable
+ * `plugin:claude-memory/mode` record per accepted switch; while the switch is
+ * off, a turn reads no memory file and enters nothing. The switch is
+ * independent of the snapshot state, so a surface replacement cannot turn
+ * memory back on, and it persists across resume. Turning it off never removes
+ * an index already shown to the model.
+ *
  * Topic files are not loaded: the framing tells the model to `cat` one only
  * when the task relates to it, which is Claude Code's on-demand rule.
  * Subagent sessions get nothing by default, as in Claude Code. A session
@@ -31,6 +39,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import * as dshSession from '@deepseek-ai/dsh-session'
 import { locateMemoryIndex, readIndex, renderIndexMessage, renderWithdrawnMessage } from './locate.js'
 
 /** Stable Cordis plugin name. */
@@ -42,8 +51,23 @@ export const inject = ['sessionProjections']
 /** Producer-owned source kind of every message this plugin enters. */
 export const SOURCE_KIND = `plugin:${name}`
 
+/** Host plugin-record writer; absent before dsh-session 0.2.1-alpha.2. */
+const appendPluginRecord = dshSession.appendPluginRecord
+
 /** Session projection key owned by this plugin. */
 export const PROJECTION_KEY = 'claudeMemory'
+
+/** Session projection key holding the per-session on/off switch. */
+export const MODE_PROJECTION_KEY = 'claudeMemoryMode'
+
+/** Slash command name that toggles the switch. */
+export const COMMAND_NAME = 'memory'
+
+/** Stable command identity the client verifies before dispatching `/memory`. */
+export const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
+
+/** Ignorable plugin-record type holding each accepted switch. */
+export const MODE_EVENT_TYPE = 'plugin:claude-memory/mode'
 
 /** Plugin configuration; every field has Claude Code's own value as default. */
 export const Config = z.object({
@@ -74,6 +98,17 @@ function digestOf(text) {
 }
 
 /**
+ * Parse the `/memory` argument grammar. An empty argument asks for status.
+ * @param {string} rawInput - text after the command name.
+ * @returns {'on' | 'off' | 'status' | undefined} the requested action, or undefined for an unknown argument.
+ */
+export function parseMemoryCommand(rawInput) {
+  const action = rawInput.trim().toLowerCase()
+  if (action === '') return 'status'
+  return action === 'on' || action === 'off' || action === 'status' ? action : undefined
+}
+
+/**
  * Validator for the persisted projection state (plain JSON).
  *
  * The registry's public type names a zod `ZodType`, but it erases the schema
@@ -96,6 +131,21 @@ export const projectionStateSchema = {
 
 /** Projection state for a session that shows no snapshot of this plugin. */
 const EMPTY_STATE = Object.freeze({ seq: null, digest: null, path: null })
+
+/**
+ * Validator for the persisted on/off switch (plain JSON).
+ * @type {{ parse(value: unknown): { enabled: boolean } }}
+ */
+export const modeStateSchema = {
+  parse(value) {
+    const ok = value !== null && typeof value === 'object' && typeof value.enabled === 'boolean'
+    if (!ok) throw new TypeError(`claude-memory: invalid mode state ${JSON.stringify(value)}`)
+    return { enabled: value.enabled }
+  },
+}
+
+/** Mode state for a session that has not switched memory off. */
+const MODE_ON = Object.freeze({ enabled: true })
 
 /**
  * Pure fold: the newest snapshot of this plugin still on the surface.
@@ -126,6 +176,21 @@ export function applyProjection(state, event) {
 }
 
 /**
+ * Pure fold for the per-session switch. The command appends one ignorable
+ * `MODE_EVENT_TYPE` record per accepted switch; surface replacements and
+ * every other event leave the switch alone, so compaction cannot reset it.
+ * @param {{ enabled: boolean }} state - prior state.
+ * @param {object} event - committed session event.
+ * @returns {{ enabled: boolean }} next state (same reference when unchanged).
+ */
+export function applyModeProjection(state, event) {
+  if (event.type !== MODE_EVENT_TYPE) return state
+  const enabled = event.data?.enabled
+  if (typeof enabled !== 'boolean' || enabled === state.enabled) return state
+  return { enabled }
+}
+
+/**
  * Mount the plugin.
  * @param {object} ctx - Cordis context with `sessionProjections`.
  * @param {z.infer<typeof Config>} config - validated configuration.
@@ -144,6 +209,54 @@ export function apply(ctx, config) {
     stateSchema: projectionStateSchema,
     init: () => EMPTY_STATE,
     apply: applyProjection,
+  })
+
+  ctx.sessionProjections.register({
+    key: MODE_PROJECTION_KEY,
+    stateVersion: 1,
+    stateSchema: modeStateSchema,
+    init: () => MODE_ON,
+    apply: applyModeProjection,
+    // Client view: the composer pill reads the switch without parsing command text.
+    wire: { viewSchema: modeStateSchema, view: (state) => ({ enabled: state.enabled }) },
+  })
+
+  // Optional: only a composed command surface can offer the switch. Injection
+  // and the mode gate work without it, with memory left on. Older hosts also
+  // lack appendPluginRecord; keep injection working and leave the switch out.
+  ctx.inject(['commands'], (commandCtx) => {
+    if (typeof appendPluginRecord !== 'function') {
+      ctx.logger.warn('claude-memory: /memory is unavailable: the host does not export appendPluginRecord')
+      return
+    }
+    try {
+      commandCtx.commands.register({
+        definitionId: COMMAND_DEFINITION_ID,
+        name: COMMAND_NAME,
+        description: 'Turn Claude Code memory on or off for this session',
+        input: { hint: 'on|off|status' },
+        handler: ({ agent, rawInput }) => {
+          const action = parseMemoryCommand(rawInput)
+          if (action === undefined) return { kind: 'error', text: 'usage: /memory on|off|status' }
+          const mode = ctx.sessionProjections.stateOf(agent.session, MODE_PROJECTION_KEY)
+          if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
+          if (action === 'status') return { kind: 'success', text: `Claude Code memory is ${mode.enabled ? 'on' : 'off'}` }
+          const enabled = action === 'on'
+          if (mode.enabled === enabled) return { kind: 'success', text: `Claude Code memory is already ${action}` }
+          let seq
+          try {
+            seq = appendPluginRecord(agent.session, MODE_EVENT_TYPE, { enabled })
+          } catch (error) {
+            ctx.logger.warn(`claude-memory: cannot store the memory switch for session ${agent.session.id}: ${error.message}`)
+            return { kind: 'error', text: 'could not change the Claude Code memory switch; the session log rejected the update' }
+          }
+          return { kind: 'success', text: `Claude Code memory ${action}`, sourceEventSeq: seq }
+        },
+      })
+    } catch (error) {
+      // A name collision on the optional command must not disable injection.
+      ctx.logger.warn(`claude-memory: cannot register /${COMMAND_NAME}: ${error.message}`)
+    }
   })
 
   const snapshotMessage = (text, path) => createUserMessage({
@@ -193,6 +306,9 @@ export function apply(ctx, config) {
     // entry owns a no-step turn, and later steps are tool continuations.
     if (decision.kind === 'reject' || step !== 1 || decision.messages.length === 0) return decision
     const session = agent.session
+    const mode = ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY)
+    if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
+    if (!mode.enabled) return decision
     if (session.header.origin === 'subagent' && !config.includeSubagents) return decision
     const cwd = session.header.cwd
     if (cwd === undefined) return decision
@@ -225,6 +341,11 @@ export function apply(ctx, config) {
     }
     if (state.digest === message.source.digest) return decision
     if (decision.messages.some((entry) => entry.source?.kind === SOURCE_KIND && entry.source.digest === message.source.digest)) return decision
+    // A switch can land while the index is being located and read; re-read it
+    // so a turn that has since been switched off enters nothing.
+    const latestMode = ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY)
+    if (latestMode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
+    if (!latestMode.enabled) return decision
     ctx.logger.info(`claude-memory: entered ${message.source.path} (${Buffer.byteLength(message.content[0].text, 'utf8')} bytes) into session ${session.id}`)
     // Right after the claimed batch: the user's prompt precedes the index and
     // driver-appended runtime context follows it. When an earlier listener

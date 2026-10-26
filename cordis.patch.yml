@@ -1,4 +1,4 @@
-# dsh-claude-memory bundle patch: one plugin row, no services, no client.
+# dsh-claude-memory bundle patch: one server row and one web client bundle, no services.
 # Override `config` from the profile's own cordis.patch.yml by addressing the
 # same id; removing the dependency removes the row.
 - insert:
@@ -7,6 +7,6 @@
       config:
         # claudeHome: ~/.claude          Claude Code config directory
         # maxLines: 200                  Claude Code's own index cap
-        # maxBytes: 25600                Claude Code's own index cap
+        # maxChars: 25000                Claude Code's own index cap
         # includeSubagents: false        Claude Code gives subagents no memory
         {}
