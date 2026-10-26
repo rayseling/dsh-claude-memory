@@ -4,11 +4,14 @@ Status: implemented
 
 ## Problem
 
-插件在每个会话第一步自动注入项目索引,没有会话级选择。想只让某个会话不加载或更新记忆,只能改 profile 配置或卸载插件,这对同一 dsh 进程里的其他会话也生效。需要一个每会话独立、默认打开、普通续聊后仍保持的开关。
+插件在每个会话第一步自动注入项目索引,没有会话级选择。想只让某个会话不加载或更新记忆,只能改 profile 配置或卸载插件,这对同一 dsh 进程里的其他会话也生效。需要一个每会话独立、普通续聊后仍保持的开关;默认位置由 profile 决定,用户要的默认是关。
 
 ## Decision
 
-`/memory on|off|status` 命令控制当前会话的开关,默认 `on`。
+`/memory on|off|status` 命令控制当前会话的开关;没切换过的会话取配置 `enabledByDefault`,默认 `false`。
+
+- 投影状态是 `{ enabled: true | false | null }`,`null` 表示会话没运行过 `/memory on|off`;默认值在读取时由 `config.enabledByDefault` 解析(`isEnabled`),不写进状态。这样改 profile 默认值,所有没切换过的会话(含已有投影 checkpoint 的)立即跟随;状态只记用户的明确选择。wire view 发给 client 的是解析后的布尔,pill 不需要知道默认值。
+- `enabledByDefault: false` 是本插件唯一不取 Claude Code 默认值的配置项:Claude Code 始终加载,用户要求 dsh 会话默认不加载、按需打开。`true` 恢复 Claude Code 的行为。
 
 - 命令只在有交互 command adapter 的 Web 客户端可用;shipped headless/ACP 有 `commands` 服务但没有 adapter,注册了也无法派发,插件仍正常注入。命令用稳定 `definitionId: 'dsh-claude-memory'` 注册;client 分发前用 `remote.commands.list` 确认当前生效的同名命令仍属于本插件,名字被占用/遮蔽时不动手。
 - 开关状态放进独立的 `claudeMemoryMode` 会话投影,不放进 [`claudeMemory` 的去重状态](../architecture/2026-10-12-dedup-state-in-session-projection.md)。命令 handler 校验参数后 `appendPluginRecord(session, 'plugin:claude-memory/mode', { enabled })`;投影只折叠这条带 `ignorable: true` 的记录。surface 替换和压缩不会碰它,所以不会被重置成 `on`。
@@ -29,13 +32,14 @@ Status: implemented
 
 ## Testing
 
-`test/plugin.test.js` 覆盖:开关投影的默认值、折叠、wire view 与忽略 surface 替换,`/memory` 参数解析、命令注册与注册失败、命令写入成功与抛出异常、重复开关不追加记录,关闭后不注入不刷新、中途关闭不注入,压缩后仍保持关闭,重新打开后注入变化后的索引、索引未变不重注、索引删除则撤回;另有一条真实 `SessionProjectionRegistry` 测试,验证 live drive、`ignorable` 标记和从 seed 日志恢复。`test/client.test.js` 用假 loader/React 驱动 client 闭包、slot 注册、命令执行、handler/传输错误、subagent 可用性和 on/off 标签。`npm test` 全部通过。
+`test/plugin.test.js` 覆盖:开关投影的未设置状态、`enabledByDefault` 两种取值下的 wire view 与命令回显、默认关时不注入直到 `/memory on`、折叠与忽略 surface 替换,`/memory` 参数解析、命令注册与注册失败、命令写入成功与抛出异常、重复开关不追加记录,关闭后不注入不刷新、中途关闭不注入,压缩后仍保持关闭,重新打开后注入变化后的索引、索引未变不重注、索引删除则撤回;另有一条真实 `SessionProjectionRegistry` 测试,验证 live drive、`ignorable` 标记和从 seed 日志恢复。`test/client.test.js` 用假 loader/React 驱动 client 闭包、slot 注册、命令执行、handler/传输错误、subagent 可用性和 on/off 标签。`npm test` 全部通过。
 
 ## Alternatives considered
 
 - **profile 级 `enabled` 或直接移除插件行。** 最简单,但作用于整个 profile,不能只关一个会话。
 - **一次性关闭(只关下一轮)。** 省一次"记得开回来",但要在拒绝、续聊、压缩、并发下消费一次性状态;用户明确只需要持久开关,收益不值得这些边界。
 - **关闭时追加一条"忽略旧索引"的提示。** 用户要的是停止加载或更新,不是让模型忘掉已展示内容。提示会多一条模型可见消息,还会让重新打开时必须重注整份索引;不采纳。
+- **默认值写进投影初始状态(`init: () => ({ enabled: config.enabledByDefault })`)。** 更直接,但投影 checkpoint 会把初始状态存下来,之后改配置对已有会话不生效;而且分不清"用户选了 on"和"默认是 on"。改为状态存 `null`、读时解析。
 - **把开关写进现有 `claudeMemory` 投影。** 该投影在 surface 替换时整体清空,会把 `off` 重置成 `on`;拆成独立投影更稳。
 - **解析 `command/run` 事件来更新开关。** 命令在附件校验之前就写入 `command/run`,一次被拒绝的 `/memory off` 也会改状态;由 handler 在参数和附件校验通过后 append 专用记录更准确。
 - **用 `session.append` 写自定义事件。** `session.append` 不写 `ignorable` 标记,而持久化读取只接受已知事件类型或带该标记的记录;续聊会拒绝整条日志。改用 `appendPluginRecord`,记录带 `ignorable: true`,旧 reader 会保留并跳过。
@@ -48,8 +52,8 @@ Status: implemented
 - 收益:同一 dsh 进程里可以按会话关闭记忆,不需要改 profile;关闭后连磁盘 stat 都不做。
 - 代价:server 新增两个宿主接口——可选的 `commands` 注册和 `appendPluginRecord('plugin:claude-memory/mode')`;后者让 `@deepseek-ai/dsh-session`(>= 0.2.1-alpha.2)成为 peer 依赖;更旧的宿主只记一条警告、不注册 `/memory`,注入继续。client 半用 `slots`/`remote`/`remote.commands`/`sessions`/`locale`,并让 `dsh.client` 进入 web 构建。命令名 `memory` 若与别的插件冲突,注册失败只记警告,注入继续,但该会话无法切换。
 - 关闭前已经注入的索引仍在模型上下文里;要真正无记忆,应在会话第一轮前关闭,或使用不装插件的 profile/preset。
-- shipped headless/ACP 没有命令 adapter,或宿主缺少 `appendPluginRecord` 时只能保持默认 `on`;后者加载时记警告。
-- 宿主对 plugin record 的格式迁移是 best-effort:普通续聊、fork、压缩会携带该记录,迁移若丢失它,开关回到默认 `on`。
+- shipped headless/ACP 没有命令 adapter,或宿主缺少 `appendPluginRecord` 时只能停在配置默认值;默认关意味着这类宿主要在 profile 里设 `enabledByDefault: true` 才会注入。后者加载时记警告。
+- 宿主对 plugin record 的格式迁移是 best-effort:普通续聊、fork、压缩会携带该记录,迁移若丢失它,开关回到配置默认值。
 - peer 范围 `>=0.2.1-alpha.2` 按 semver 只匹配同 patch 的预发布版;后续 patch 的 alpha/beta 可能被 pnpm 判为不满足,正式版不受影响。
 - client 改动没有构建/HMR,改完要重启 profile:web;`dsh.client` 指向的 `src/client.js` 缺失或语法错误会让 web 客户端加载失败。
 - 每次点 pill 都走一次 `/memory on|off` 命令,会话日志会留下 `command/run`、`command/done`,界面可能显示一条命令记录;这是宿主命令面的既有行为。

@@ -20,6 +20,7 @@ import {
   applyProjection,
   inject,
   modeStateSchema,
+  modeViewSchema,
   name,
   parseMemoryCommand,
   projectionStateSchema,
@@ -43,7 +44,8 @@ const lastModeEvent = (session) => session.snapshotEvents().filter((event) => ev
 /**
  * Mount the plugin against a recording context whose projection registry
  * folds committed events exactly as the host does, and return the pre-step
- * listener plus helpers that commit events to a fake session.
+ * listener plus helpers that commit events to a fake session. Injection
+ * tests mount with the switch on; the shipped default (off) has its own tests.
  */
 function mount(config = {}, { withCommands = false, commandError = undefined } = {}) {
   const logs = []
@@ -85,13 +87,14 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
       },
     },
   }
-  apply(ctx, Config(config))
+  apply(ctx, Config({ enabledByDefault: true, ...config }))
   const definition = definitions.get(PROJECTION_KEY)
   const modeDefinition = definitions.get(MODE_PROJECTION_KEY)
   assert.equal(definition.key, PROJECTION_KEY)
   assert.equal(definition.stateVersion, 2)
   assert.equal(modeDefinition.key, MODE_PROJECTION_KEY)
-  assert.equal(modeDefinition.stateVersion, 1)
+  assert.equal(modeDefinition.stateVersion, 2)
+  assert.deepEqual(modeDefinition.init(), { enabled: null })
   assert.deepEqual(modeDefinition.wire.view({ enabled: false }), { enabled: false })
   assert.deepEqual(modeDefinition.wire.viewSchema.parse({ enabled: false }), { enabled: false })
   const commit = (session, event) => {
@@ -143,6 +146,7 @@ test('Config applies Claude Code defaults and validates caps', () => {
   assert.equal(resolved.maxLines, 200)
   assert.equal(resolved.maxChars, 25_000)
   assert.equal(resolved.includeSubagents, false)
+  assert.equal(resolved.enabledByDefault, false)
   assert.ok(resolved.claudeHome.endsWith('/.claude'))
   assert.throws(() => Config({ maxLines: 0 }))
   assert.throws(() => Config({ maxChars: 1.5 }))
@@ -175,12 +179,21 @@ test('projection fold records this plugin snapshots, ignores other events, and c
   assert.equal(applyProjection(seen, notice), seen)
 })
 
-test('mode state schema accepts only the on/off shape', () => {
+test('mode state schema accepts on, off, and unset; the view schema only on and off', () => {
   assert.deepEqual(modeStateSchema.parse({ enabled: false, extra: 1 }), { enabled: false })
   assert.deepEqual(modeStateSchema.parse({ enabled: true }), { enabled: true })
+  assert.deepEqual(modeStateSchema.parse({ enabled: null }), { enabled: null })
   assert.throws(() => modeStateSchema.parse({ enabled: 'yes' }))
   assert.throws(() => modeStateSchema.parse({}))
   assert.throws(() => modeStateSchema.parse(null))
+  assert.deepEqual(modeViewSchema.parse({ enabled: true }), { enabled: true })
+  assert.throws(() => modeViewSchema.parse({ enabled: null }))
+})
+
+test('the wire view resolves an unset switch from enabledByDefault', () => {
+  assert.deepEqual(mount({ enabledByDefault: false }).modeDefinition.wire.view({ enabled: null }), { enabled: false })
+  assert.deepEqual(mount({ enabledByDefault: true }).modeDefinition.wire.view({ enabled: null }), { enabled: true })
+  assert.deepEqual(mount({ enabledByDefault: true }).modeDefinition.wire.view({ enabled: false }), { enabled: false })
 })
 
 test('parses the /memory argument grammar', () => {
@@ -194,9 +207,9 @@ test('parses the /memory argument grammar', () => {
 })
 
 test('mode projection folds only switch events and ignores surface replacements', () => {
-  const on = { enabled: true }
-  assert.equal(applyModeProjection(on, { type: 'command/run', data: { name: COMMAND_NAME, args: 'off' } }), on)
-  const off = applyModeProjection(on, { type: MODE_EVENT_TYPE, data: { enabled: false } })
+  const unset = { enabled: null }
+  assert.equal(applyModeProjection(unset, { type: 'command/run', data: { name: COMMAND_NAME, args: 'off' } }), unset)
+  const off = applyModeProjection(unset, { type: MODE_EVENT_TYPE, data: { enabled: false } })
   assert.deepEqual(off, { enabled: false })
   assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: { enabled: false } }), off)
   assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: {} }), off)
@@ -230,6 +243,8 @@ test('the /memory command appends the switch and reports state', async () => {
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is on' })
   const off = command.handler({ agent, rawInput: 'off' })
   assert.equal(off.kind, 'success')
   assert.equal(off.text, 'Claude Code memory off')
@@ -247,6 +262,20 @@ test('the /memory command appends the switch and reports state', async () => {
   assert.deepEqual(command.handler({ agent, rawInput: 'bogus' }), { kind: 'error', text: 'usage: /memory on|off|status' })
 })
 
+test('on the shipped default the switch is off until /memory on, and "already off" appends nothing', async () => {
+  const { commands, commit, ctx } = mount({ enabledByDefault: false }, { withCommands: true })
+  const command = commands[0]
+  const session = await newRealSession()
+  const agent = { session }
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Claude Code memory is already off' })
+  assert.equal(lastModeEvent(session), undefined)
+  assert.equal(command.handler({ agent, rawInput: 'on' }).kind, 'success')
+  commit(session, lastModeEvent(session))
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is on' })
+})
+
 test('a throwing switch append leaves the mode unchanged and reports an error', () => {
   const { commands, logs, ctx } = mount({}, { withCommands: true })
   const command = commands[0]
@@ -254,7 +283,7 @@ test('a throwing switch append leaves the mode unchanged and reports an error', 
   const result = command.handler({ agent: { session }, rawInput: 'off' })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /session log rejected/)
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
   assert.match(logs.at(-1)[1], /cannot store the memory switch/)
 })
 
@@ -267,14 +296,24 @@ test('the real projection service restores the switch from the committed log', a
   await new Promise((resolve) => setTimeout(resolve, 0))
   const session = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`))
   const agent = { id: session.id, session }
-  const execution = await ctx.commands.execute(agent, '/memory off', [], new AbortController().signal)
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
+  const execution = await ctx.commands.execute(agent, '/memory on', [], new AbortController().signal)
   assert.ok(execution)
   assert.equal(execution.result.kind, 'success')
   assert.ok(Number.isInteger(execution.result.sourceEventSeq))
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: false })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
   assert.ok(session.snapshotEvents().some((event) => event.type === MODE_EVENT_TYPE && event.ignorable === true))
   const restored = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`), { seed: session.snapshotEvents() })
-  assert.deepEqual(ctx.sessionProjections.stateOf(restored, MODE_PROJECTION_KEY), { enabled: false })
+  assert.deepEqual(ctx.sessionProjections.stateOf(restored, MODE_PROJECTION_KEY), { enabled: true })
+})
+
+test('on the shipped default a session enters nothing until /memory on', async () => {
+  const { home, project } = seedProject()
+  const { listener, commit } = mount({ claudeHome: home, enabledByDefault: false })
+  const agent = fakeAgent({ cwd: project })
+  assert.equal((await run(listener, { agent })).messages.length, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 1, data: { enabled: true } })
+  assert.equal((await run(listener, { agent })).messages.length, 2)
 })
 
 test('enters the index right after the claimed batch, with a sourced snapshot', async () => {
