@@ -10,4 +10,6 @@
         # maxChars: 25000                Claude Code's own index cap
         # includeSubagents: false        Claude Code gives subagents no memory
         # enabledByDefault: false        switch position before /memory on|off; true loads like Claude Code
+        # ownMemory: true                also offer the model its own store, which it writes
+        # ownMemoryHome: ~/.dsh/memory   root of the own store, one <slug>/ per project
         {}

@@ -22,17 +22,17 @@ window.__ModuleLoader__.load({
     const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
     const NS = 'claude-memory'
     const zh = {
-      'button.on': 'Claude Code 记忆:开',
-      'button.off': 'Claude Code 记忆:关',
+      'button.on': '记忆:开',
+      'button.off': '记忆:关',
       'button.busy': '切换中…',
-      'button.title': '切换本会话的 Claude Code 记忆',
+      'button.title': '切换本会话的项目记忆',
       'button.failed': '切换失败',
     }
     const en = {
-      'button.on': 'Claude Code memory: on',
-      'button.off': 'Claude Code memory: off',
+      'button.on': 'Memory: on',
+      'button.off': 'Memory: off',
       'button.busy': 'Switching…',
-      'button.title': 'Toggle Claude Code memory for this session',
+      'button.title': 'Toggle project memory for this session',
       'button.failed': 'Switch failed',
     }
     const pillStyle = {

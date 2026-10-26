@@ -1,7 +1,7 @@
 {
   "name": "dsh-claude-memory",
-  "version": "0.4.0",
-  "description": "Loads the Claude Code auto-memory index (~/.claude/projects/<slug>/memory/MEMORY.md) of the session's project into every DeepSeek Harness session, the way Claude Code itself loads it: the index at the first step, topic files on demand.",
+  "version": "0.5.0",
+  "description": "Gives every DeepSeek Harness session its project's persistent memory: the read-only Claude Code auto-memory index (~/.claude/projects/<slug>/memory/MEMORY.md) and the harness's own store (~/.dsh/memory/<slug>/) that the model writes, loaded the way Claude Code loads memory: the index at the first step, topic files on demand.",
   "type": "module",
   "main": "src/index.js",
   "exports": {

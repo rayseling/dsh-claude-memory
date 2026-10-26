@@ -1,11 +1,18 @@
 /**
- * dsh-claude-memory — give a DeepSeek Harness session the Claude Code memory of
- * the project it works in, the way Claude Code loads it itself.
+ * dsh-claude-memory — give a DeepSeek Harness session the persistent memory of
+ * the project it works in: the Claude Code memory Claude Code maintains, read
+ * the way Claude Code loads it, and the harness's own store, which the model
+ * maintains with the same file format.
  *
- * At the first step of every turn the plugin locates the project's
- * `MEMORY.md` (see `./locate.js`), reads it within Claude Code's own index
- * cap, and enters it as one `user`-role message with a producer-owned source
- * (`plugin:claude-memory`, form `snapshot`). The message is an ordinary
+ * At the first step of every turn the plugin locates the project's Claude
+ * Code `MEMORY.md` and its own store (see `./locate.js`), reads each index
+ * within Claude Code's own index cap, and enters both as one `user`-role
+ * message with a producer-owned source (`plugin:claude-memory`, form
+ * `snapshot`). The own-store section is present whenever that store is
+ * enabled, entries or not, because it carries the directory and the writing
+ * rules the model needs to create the first memory. The plugin itself never
+ * writes a memory file: the model does, with its ordinary file tools, and the
+ * next turn re-enters the changed index. The message is an ordinary
  * `user/message` session event, so it replays, compacts, and resumes like the
  * rest of the history and the model-visible state stays reconstructable from
  * the log.
@@ -41,7 +48,7 @@ import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
-import { locateMemoryIndex, readIndex, renderIndexMessage, renderWithdrawnMessage } from './locate.js'
+import { locateMemoryIndex, locateOwnIndex, readIndex, renderMemoryMessage, renderWithdrawnMessage } from './locate.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'claude-memory'
@@ -70,10 +77,14 @@ export const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
 /** Ignorable plugin-record type holding each accepted switch. */
 export const MODE_EVENT_TYPE = 'plugin:claude-memory/mode'
 
-/** Plugin configuration; every field but `enabledByDefault` has Claude Code's own value as default. */
+/** Plugin configuration; every field but `enabledByDefault` and the own store's has Claude Code's own value as default. */
 export const Config = z.object({
   /** Claude Code configuration directory holding `projects/`. A leading `~/` expands to the home directory. */
   claudeHome: z.string().default(join(homedir(), '.claude')),
+  /** Offer the model a memory store of its own, read and written beside the read-only Claude Code index. */
+  ownMemory: z.boolean().default(true),
+  /** Root of the own store, one `<slug>/` directory per project. A leading `~/` expands to the home directory. */
+  ownMemoryHome: z.string().default(join(homedir(), '.dsh', 'memory')),
   /** Maximum index lines entered, as Claude Code caps its own load. */
   maxLines: z.number().step(1).min(1).default(200),
   /** Maximum index UTF-16 code units entered, as Claude Code caps its own load. */
@@ -215,9 +226,10 @@ export function applyModeProjection(state, event) {
  */
 export function apply(ctx, config) {
   const claudeHome = expandHome(config.claudeHome)
+  const ownMemoryHome = expandHome(config.ownMemoryHome)
   const limits = { maxLines: config.maxLines, maxChars: config.maxChars }
-  /** Rendered index per path, reused while the file's size and mtime hold. */
-  const rendered = new Map()
+  /** Bounded index text per path, reused while the file's size and mtime hold. */
+  const bounded = new Map()
   /** Paths already warned about per session, so a persistent read failure logs once. */
   const warned = new WeakMap()
 
@@ -255,24 +267,24 @@ export function apply(ctx, config) {
       commandCtx.commands.register({
         definitionId: COMMAND_DEFINITION_ID,
         name: COMMAND_NAME,
-        description: 'Turn Claude Code memory on or off for this session',
+        description: 'Turn project memory on or off for this session',
         input: { hint: 'on|off|status' },
         handler: ({ agent, rawInput }) => {
           const action = parseMemoryCommand(rawInput)
           if (action === undefined) return { kind: 'error', text: 'usage: /memory on|off|status' }
           const mode = ctx.sessionProjections.stateOf(agent.session, MODE_PROJECTION_KEY)
           if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
-          if (action === 'status') return { kind: 'success', text: `Claude Code memory is ${isEnabled(mode) ? 'on' : 'off'}` }
+          if (action === 'status') return { kind: 'success', text: `Memory is ${isEnabled(mode) ? 'on' : 'off'}` }
           const enabled = action === 'on'
-          if (isEnabled(mode) === enabled) return { kind: 'success', text: `Claude Code memory is already ${action}` }
+          if (isEnabled(mode) === enabled) return { kind: 'success', text: `Memory is already ${action}` }
           let seq
           try {
             seq = appendPluginRecord(agent.session, MODE_EVENT_TYPE, { enabled })
           } catch (error) {
             ctx.logger.warn(`claude-memory: cannot store the memory switch for session ${agent.session.id}: ${error.message}`)
-            return { kind: 'error', text: 'could not change the Claude Code memory switch; the session log rejected the update' }
+            return { kind: 'error', text: 'could not change the memory switch; the session log rejected the update' }
           }
-          return { kind: 'success', text: `Claude Code memory ${action}`, sourceEventSeq: seq }
+          return { kind: 'success', text: `Memory ${action}`, sourceEventSeq: seq }
         },
       })
     } catch (error) {
@@ -295,14 +307,14 @@ export function apply(ctx, config) {
   }
 
   /**
-   * The current index message for a located file, from cache when its size
-   * and mtime hold (an in-place rewrite that preserves both is not noticed).
+   * The bounded text of a located index file, from cache when its size and
+   * mtime hold (an in-place rewrite that preserves both is not noticed).
    * A read failure is reported as its own kind and never cached: it says
    * nothing about the file's content, so the caller must not withdraw.
-   * @returns {Promise<{ kind: 'text', text: string, digest: string } | { kind: 'blank' } | { kind: 'error' }>}
+   * @returns {Promise<{ kind: 'text', text: string, truncated: boolean } | { kind: 'blank' } | { kind: 'error' }>}
    */
   const currentIndex = async (session, located) => {
-    const cached = rendered.get(located.path)
+    const cached = bounded.get(located.path)
     if (cached !== undefined && cached.size === located.size && cached.mtimeMs === located.mtimeMs) return cached.value
     let index
     try {
@@ -311,15 +323,46 @@ export function apply(ctx, config) {
       warnOnce(session, located.path, `claude-memory: cannot read ${located.path}: ${error.message}`)
       return { kind: 'error' }
     }
-    let value
-    if (index.text.trim().length === 0) {
-      value = { kind: 'blank' }
-    } else {
-      const text = renderIndexMessage({ path: located.path, ...index })
-      value = { kind: 'text', text, digest: digestOf(text) }
-    }
-    rendered.set(located.path, { size: located.size, mtimeMs: located.mtimeMs, value })
+    const value = index.text.trim().length === 0 ? { kind: 'blank' } : { kind: 'text', ...index }
+    bounded.set(located.path, { size: located.size, mtimeMs: located.mtimeMs, value })
     return value
+  }
+
+  /**
+   * Locate both stores for a working directory and read their indexes. A
+   * store whose index cannot be inspected or read yields `undefined` for the
+   * whole result, so the turn enters nothing rather than a message missing a
+   * section it could not vouch for.
+   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean } } | undefined>}
+   */
+  const currentStores = async (session, cwd, signal) => {
+    let located
+    let own
+    try {
+      located = await locateMemoryIndex(cwd, claudeHome)
+      own = config.ownMemory ? await locateOwnIndex(cwd, ownMemoryHome) : undefined
+    } catch (error) {
+      // The file may exist but cannot be inspected right now; say nothing rather than withdraw.
+      warnOnce(session, cwd, `claude-memory: cannot inspect the memory index for ${cwd}: ${error.message}`)
+      return undefined
+    }
+    signal.throwIfAborted()
+    const stores = {}
+    if (located !== undefined) {
+      const index = await currentIndex(session, located)
+      if (index.kind === 'error') return undefined
+      if (index.kind === 'text') stores.claude = { path: located.path, text: index.text, truncated: index.truncated }
+    }
+    if (own !== undefined) {
+      stores.own = { path: own.path, truncated: false }
+      if (own.size !== undefined) {
+        const index = await currentIndex(session, own)
+        if (index.kind === 'error') return undefined
+        if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated }
+      }
+    }
+    signal.throwIfAborted()
+    return stores
   }
 
   ctx.on('agent/pre-step', async ({ agent, messages, step, signal }, next) => {
@@ -336,30 +379,15 @@ export function apply(ctx, config) {
     if (cwd === undefined) return decision
     const state = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
     if (state === undefined) throw new Error('claude-memory requires its session projection to be registered')
-    let located
-    try {
-      located = await locateMemoryIndex(cwd, claudeHome)
-    } catch (error) {
-      // The file may exist but cannot be inspected right now; say nothing rather than withdraw.
-      warnOnce(session, cwd, `claude-memory: cannot inspect the memory index for ${cwd}: ${error.message}`)
-      return decision
-    }
-    signal.throwIfAborted()
+    const stores = await currentStores(session, cwd, signal)
+    if (stores === undefined) return decision
     let message
-    if (located === undefined) {
+    if (stores.claude === undefined && stores.own === undefined) {
+      // Nothing to show: withdraw an index the model has seen, otherwise stay silent.
       if (state.digest === null || state.path === null) return decision
       message = snapshotMessage(renderWithdrawnMessage(state.path), state.path)
     } else {
-      const index = await currentIndex(session, located)
-      signal.throwIfAborted()
-      if (index.kind === 'error') return decision
-      if (index.kind === 'blank') {
-        if (state.digest === null) return decision
-        message = snapshotMessage(renderWithdrawnMessage(located.path), located.path)
-      } else {
-        if (state.digest === index.digest) return decision
-        message = snapshotMessage(index.text, located.path)
-      }
+      message = snapshotMessage(renderMemoryMessage(stores), stores.claude?.path ?? stores.own.path)
     }
     if (state.digest === message.source.digest) return decision
     if (decision.messages.some((entry) => entry.source?.kind === SOURCE_KIND && entry.source.digest === message.source.digest)) return decision

@@ -10,7 +10,7 @@ Status: implemented
 
 - 注入文本写明"这是完整的当前索引,替代此前展示过的",否则被删掉的条目还会被模型当成存在。
 - 摘要(digest)相同不注入;不同就注入新 snapshot 覆盖。
-- 记忆消失要撤回:展示过的索引文件不见了(stat 得 ENOENT/ENOTDIR)或变空,注入一条撤回 snapshot;它同样带 digest,所以只进一次。
+- 记忆消失要撤回:展示过的索引文件不见了(stat 得 ENOENT/ENOTDIR)或变空,注入一条撤回 snapshot;它同样带 digest,所以只进一次。两个存储合成一条消息后,撤回只在没有任何一段可展示时发生;[dsh 自己的段](2026-10-26-own-memory-store.md) 开着就始终存在,Claude Code 索引消失只是下一条替代消息少一段。
 - 读不到不算消失:读失败、stat 得其它错误(EACCES/EIO)说明不了内容。`currentIndex` 用判别式 `kind: 'text' | 'blank' | 'error'` 区分;error 不缓存、不撤回、每会话只警告一次。
 
 ## Alternatives considered

@@ -45,7 +45,10 @@ const lastModeEvent = (session) => session.snapshotEvents().filter((event) => ev
  * Mount the plugin against a recording context whose projection registry
  * folds committed events exactly as the host does, and return the pre-step
  * listener plus helpers that commit events to a fake session. Injection
- * tests mount with the switch on; the shipped default (off) has its own tests.
+ * tests mount with the switch on and the own store off, so "nothing entered"
+ * keeps meaning "no Claude Code index"; the shipped defaults (switch off, own
+ * store on) have their own tests. The own store's home always points into a
+ * scratch directory so no test reads the developer's `~/.dsh/memory`.
  */
 function mount(config = {}, { withCommands = false, commandError = undefined } = {}) {
   const logs = []
@@ -87,7 +90,7 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
       },
     },
   }
-  apply(ctx, Config({ enabledByDefault: true, ...config }))
+  apply(ctx, Config({ enabledByDefault: true, ownMemory: false, ownMemoryHome: scratch(), ...config }))
   const definition = definitions.get(PROJECTION_KEY)
   const modeDefinition = definitions.get(MODE_PROJECTION_KEY)
   assert.equal(definition.key, PROJECTION_KEY)
@@ -147,7 +150,9 @@ test('Config applies Claude Code defaults and validates caps', () => {
   assert.equal(resolved.maxChars, 25_000)
   assert.equal(resolved.includeSubagents, false)
   assert.equal(resolved.enabledByDefault, false)
+  assert.equal(resolved.ownMemory, true)
   assert.ok(resolved.claudeHome.endsWith('/.claude'))
+  assert.ok(resolved.ownMemoryHome.endsWith('/.dsh/memory'))
   assert.throws(() => Config({ maxLines: 0 }))
   assert.throws(() => Config({ maxChars: 1.5 }))
 })
@@ -244,18 +249,18 @@ test('the /memory command appends the switch and reports state', async () => {
   const session = await newRealSession()
   const agent = { session }
   assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is on' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is on' })
   const off = command.handler({ agent, rawInput: 'off' })
   assert.equal(off.kind, 'success')
-  assert.equal(off.text, 'Claude Code memory off')
+  assert.equal(off.text, 'Memory off')
   assert.ok(Number.isInteger(off.sourceEventSeq))
   commit(session, lastModeEvent(session))
   assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: false })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is off' })
-  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Claude Code memory is already off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Memory is already off' })
   const on = command.handler({ agent, rawInput: 'on' })
   assert.equal(on.kind, 'success')
-  assert.equal(on.text, 'Claude Code memory on')
+  assert.equal(on.text, 'Memory on')
   assert.ok(Number.isInteger(on.sourceEventSeq))
   commit(session, lastModeEvent(session))
   assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
@@ -267,13 +272,13 @@ test('on the shipped default the switch is off until /memory on, and "already of
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is off' })
-  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Claude Code memory is already off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Memory is already off' })
   assert.equal(lastModeEvent(session), undefined)
   assert.equal(command.handler({ agent, rawInput: 'on' }).kind, 'success')
   commit(session, lastModeEvent(session))
   assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Claude Code memory is on' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is on' })
 })
 
 test('a throwing switch append leaves the mode unchanged and reports an error', () => {
@@ -575,4 +580,116 @@ test('warns once per session for an unreadable index', async () => {
 test('expands ~ in claudeHome', async () => {
   const { listener } = mount({ claudeHome: '~/.claude-does-not-exist-for-this-test' })
   assert.equal((await run(listener, { agent: fakeAgent({ cwd: scratch() }) })).messages.length, 1)
+})
+
+/** A project whose own-store index is already written; the Claude Code home stays empty. */
+function seedOwn(text = '- [Deploy host](deploy-host.md) — 部署机是 mini\n') {
+  const ownHome = scratch()
+  const project = scratch()
+  const dir = join(ownHome, slugOf(project))
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'MEMORY.md'), text)
+  return { ownHome, project, ownPath: join(dir, 'MEMORY.md') }
+}
+
+test('with the own store on, a project without any memory still gets the directory and the writing rules', async () => {
+  const ownHome = scratch()
+  const project = scratch()
+  const { listener, logs } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome })
+  const decision = await run(listener, { agent: fakeAgent({ cwd: project }) })
+  assert.equal(decision.messages.length, 2)
+  const text = decision.messages[1].content[0].text
+  assert.equal(decision.messages[1].source.path, join(ownHome, slugOf(project), 'MEMORY.md'))
+  assert.ok(text.includes(`lives in ${join(ownHome, slugOf(project))}. It has no entries yet`))
+  assert.ok(text.includes('Save a memory in'))
+  assert.ok(!text.includes("Claude Code's memory index"))
+  assert.deepEqual(logs.map(([level]) => level), ['info'])
+})
+
+test('with the own store on, both indexes enter as one snapshot keyed by the Claude Code path', async () => {
+  const { home, project, path } = seedProject('- [Reply in Chinese](reply-in-chinese.md) — 用中文回复\n')
+  const ownHome = scratch()
+  mkdirSync(join(ownHome, slugOf(project)), { recursive: true })
+  const ownPath = join(ownHome, slugOf(project), 'MEMORY.md')
+  writeFileSync(ownPath, '- [Deploy host](deploy-host.md) — 部署机是 mini\n')
+  const { listener } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome })
+  const decision = await run(listener, { agent: fakeAgent({ cwd: project }) })
+  assert.equal(decision.messages.length, 2)
+  const text = decision.messages[1].content[0].text
+  assert.equal(decision.messages[1].source.path, path)
+  assert.ok(text.includes(`Contents of ${path}`))
+  assert.ok(text.includes('- [Reply in Chinese](reply-in-chinese.md)'))
+  assert.ok(text.includes(`Contents of ${ownPath}`))
+  assert.ok(text.includes('- [Deploy host](deploy-host.md)'))
+})
+
+test('a memory the model writes is entered on the next turn, and a vanished Claude Code index drops its section without a withdrawal', async () => {
+  const { home, project, path } = seedProject('- one\n')
+  const ownHome = scratch()
+  const { listener, commit } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.ok(first.messages[1].content[0].text.includes('It has no entries yet'))
+  commitAll(commit, agent.session, first, 1)
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'unchanged: nothing entered')
+  const dir = join(ownHome, slugOf(project))
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'MEMORY.md'), '- [Deploy host](deploy-host.md) — 部署机是 mini\n')
+  const written = await run(listener, { agent })
+  assert.equal(written.messages.length, 2)
+  assert.ok(written.messages[1].content[0].text.includes('- [Deploy host](deploy-host.md)'))
+  assert.ok(!written.messages[1].content[0].text.includes('no entries yet'))
+  commitAll(commit, agent.session, written, 10)
+  rmSync(path)
+  const gone = await run(listener, { agent })
+  assert.equal(gone.messages.length, 2)
+  const text = gone.messages[1].content[0].text
+  assert.ok(!text.includes('no longer available'), 'the own section still stands, so the message is a replacement, not a withdrawal')
+  assert.ok(!text.includes("Claude Code's memory index"))
+  assert.ok(text.includes('- [Deploy host](deploy-host.md)'))
+  assert.equal(gone.messages[1].source.path, join(dir, 'MEMORY.md'))
+})
+
+test('a blank own index reads as no entries yet, and an unreadable one enters nothing', async () => {
+  const { ownHome, project, ownPath } = seedOwn('\n\n')
+  const { listener, logs } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome })
+  const agent = fakeAgent({ cwd: project })
+  assert.ok((await run(listener, { agent })).messages[1].content[0].text.includes('It has no entries yet'))
+  const { chmodSync, readFileSync } = await import('node:fs')
+  writeFileSync(ownPath, '- [a](a.md) — b\n')
+  chmodSync(ownPath, 0o000)
+  let readable = true
+  try { readFileSync(ownPath) } catch { readable = false }
+  try {
+    if (!readable) {
+      assert.equal((await run(listener, { agent })).messages.length, 1)
+      assert.equal(logs.at(-1)[0], 'warn')
+    }
+  } finally {
+    chmodSync(ownPath, 0o644)
+  }
+})
+
+test('the own store is shared by every worktree of a repository', async () => {
+  const main = scratch()
+  mkdirSync(join(main, '.git', 'worktrees', 'feat'), { recursive: true })
+  writeFileSync(join(main, '.git', 'worktrees', 'feat', 'commondir'), '../..\n')
+  const wt = join(main, '.claude', 'worktrees', 'feat')
+  mkdirSync(wt, { recursive: true })
+  writeFileSync(join(wt, '.git'), `gitdir: ${join(main, '.git', 'worktrees', 'feat')}\n`)
+  const ownHome = scratch()
+  const { listener } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome })
+  const fromWorktree = await run(listener, { agent: fakeAgent({ cwd: wt }) })
+  const fromMain = await run(listener, { agent: { session: { id: 'session-main', header: { cwd: main } } } })
+  assert.equal(fromWorktree.messages[1].source.path, join(ownHome, slugOf(main), 'MEMORY.md'))
+  assert.equal(fromWorktree.messages[1].source.digest, fromMain.messages[1].source.digest)
+})
+
+test('ownMemory: false keeps the Claude Code index alone, and ~ expands in ownMemoryHome', async () => {
+  const { home, project } = seedProject()
+  const off = await run(mount({ claudeHome: home }).listener, { agent: fakeAgent({ cwd: project }) })
+  assert.ok(!off.messages[1].content[0].text.includes('Save a memory'))
+  const { listener } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: '~/.dsh-memory-does-not-exist-for-this-test' })
+  const expanded = await run(listener, { agent: fakeAgent({ cwd: project }) })
+  assert.ok(expanded.messages[1].content[0].text.includes(join(process.env.HOME, '.dsh-memory-does-not-exist-for-this-test')))
 })

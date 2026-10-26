@@ -5,8 +5,8 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  decodeCompletePrefix, isAbsence, locateMemoryIndex, mainRootOfWorktree, projectRoots, readIndex,
-  renderIndexMessage, renderWithdrawnMessage, slugOf, truncateIndex,
+  canonicalRoot, decodeCompletePrefix, isAbsence, locateMemoryIndex, locateOwnIndex, mainRootOfWorktree, projectRoots,
+  readIndex, renderMemoryMessage, renderWithdrawnMessage, slugOf, truncateIndex,
 } from '../src/locate.js'
 
 const scratch = () => realpathSync(mkdtempSync(join(tmpdir(), 'dsh-claude-memory-')))
@@ -216,13 +216,69 @@ test('readIndex reads a bounded window and marks a continuing file as truncated'
   for (const line of result.text.split('\n')) assert.match(line, /^- 条目\d+ 中文内容$/)
 })
 
-test('renderIndexMessage frames the path, the directory rule, and a truncation note', () => {
-  const full = renderIndexMessage({ path: '/h/.claude/projects/-p/memory/MEMORY.md', text: '- [x](x.md) — y\n', truncated: false })
-  assert.ok(full.startsWith('<system-reminder>\nContents of /h/.claude/projects/-p/memory/MEMORY.md'))
-  assert.ok(full.includes('memory file in /h/.claude/projects/-p/memory.'))
-  assert.ok(full.includes('replaces any memory index shown earlier in this conversation'))
-  assert.ok(full.endsWith('- [x](x.md) — y\n</system-reminder>'))
-  assert.ok(!full.includes('Only the beginning'))
-  assert.ok(renderIndexMessage({ path: '/m/MEMORY.md', text: 'a', truncated: true }).includes('Only the beginning of the index'))
+test('canonicalRoot resolves to the main repository, the repository, or the real directory', async () => {
+  const dir = scratch()
+  assert.equal(await canonicalRoot(dir), dir)
+  const repo = scratch()
+  mkdirSync(join(repo, '.git'))
+  mkdirSync(join(repo, 'packages', 'x'), { recursive: true })
+  assert.equal(await canonicalRoot(join(repo, 'packages', 'x')), repo)
+  const link = join(scratch(), 'x-link')
+  symlinkSync(join(repo, 'packages', 'x'), link)
+  assert.equal(await canonicalRoot(link), repo, 'a symbolic link converges on the repository behind it')
+  const main = scratch()
+  const wt = fakeWorktree(main)
+  assert.equal(await canonicalRoot(join(wt, 'deep')), main, 'a linked worktree converges on its main repository')
+  const separate = scratch()
+  writeFileSync(join(separate, '.git'), 'gitdir: /elsewhere/.git\n')
+  assert.equal(await canonicalRoot(separate), separate, 'a .git file that names no worktree is its own root')
+})
+
+test('locateOwnIndex always names the directory and reports the index only when it is a file', async () => {
+  const home = scratch()
+  const main = scratch()
+  const wt = fakeWorktree(main)
+  const expected = join(home, slugOf(main), 'MEMORY.md')
+  assert.deepEqual(await locateOwnIndex(wt, home), { root: main, path: expected })
+  mkdirSync(join(home, slugOf(main)), { recursive: true })
+  writeFileSync(expected, '- [a](a.md) — hook\n')
+  const found = await locateOwnIndex(wt, home)
+  assert.equal(found.path, expected)
+  assert.equal(found.size, Buffer.byteLength('- [a](a.md) — hook\n'))
+  assert.equal(typeof found.mtimeMs, 'number')
+  const other = scratch()
+  mkdirSync(join(home, slugOf(other), 'MEMORY.md'), { recursive: true })
+  assert.deepEqual(await locateOwnIndex(other, home), { root: other, path: join(home, slugOf(other), 'MEMORY.md') }, 'a directory named MEMORY.md is not an index')
+})
+
+test('renderMemoryMessage frames the Claude Code index read-only, the own store with its rules, and truncation per index', () => {
+  const claude = { path: '/h/.claude/projects/-p/memory/MEMORY.md', text: '- [x](x.md) — y\n', truncated: false }
+  const own = { path: '/h/.dsh/memory/-p/MEMORY.md', text: '- [z](z.md) — w\n', truncated: false }
+  const both = renderMemoryMessage({ claude, own })
+  assert.ok(both.startsWith('<system-reminder>\nPersistent memory for this project'))
+  assert.ok(both.includes('replaces any memory index shown earlier in this conversation'))
+  assert.ok(both.includes('Contents of /h/.claude/projects/-p/memory/MEMORY.md'))
+  assert.ok(both.includes('files live in /h/.claude/projects/-p/memory). Claude Code maintains these files: do not create, edit, or delete them.'))
+  assert.ok(both.includes('- [x](x.md) — y\n'))
+  assert.ok(both.includes('Contents of /h/.dsh/memory/-p/MEMORY.md (your own memory index'))
+  assert.ok(both.includes('- [z](z.md) — w\n'))
+  assert.ok(both.includes('Save a memory in /h/.dsh/memory/-p when'))
+  assert.ok(both.includes('add one line to /h/.dsh/memory/-p/MEMORY.md'))
+  assert.ok(both.includes('  type: user | feedback | project | reference'))
+  assert.ok(both.indexOf('Contents of /h/.claude') < both.indexOf('Contents of /h/.dsh'), 'the read-only index comes first')
+  assert.ok(both.endsWith('</system-reminder>'))
+  assert.ok(!both.includes('Only the beginning'))
+
+  const claudeOnly = renderMemoryMessage({ claude })
+  assert.ok(!claudeOnly.includes('your own memory'))
+  assert.ok(!claudeOnly.includes('Save a memory'))
+
+  const empty = renderMemoryMessage({ own: { path: own.path, truncated: false } })
+  assert.ok(empty.includes('Your own memory for this project lives in /h/.dsh/memory/-p. It has no entries yet'))
+  assert.ok(empty.includes('Save a memory in /h/.dsh/memory/-p when'))
+  assert.ok(!empty.includes('Contents of'))
+
+  const cut = renderMemoryMessage({ claude: { ...claude, truncated: true }, own })
+  assert.equal(cut.split('Only the beginning of this index').length, 2, 'truncation is noted on the index that was cut')
   assert.ok(renderWithdrawnMessage('/m/MEMORY.md').includes('(/m/MEMORY.md) is no longer available'))
 })
