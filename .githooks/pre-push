@@ -1,5 +1,9 @@
 #!/bin/sh
 # Every gate plus the test suite: both finish in about a second.
+# Git exports GIT_DIR (and, from a linked worktree, more GIT_* variables) to
+# hooks; a test that runs git in a scratch directory would otherwise act on
+# this repository. Drop them so only each command's cwd decides.
 set -e
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY
 node .agents/skills/dsh-gate-every-rule/scripts/run-gates.ts
 node --test test/

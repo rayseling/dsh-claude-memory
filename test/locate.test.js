@@ -12,6 +12,14 @@ import {
 const scratch = () => realpathSync(mkdtempSync(join(tmpdir(), 'dsh-claude-memory-')))
 const limits = { maxLines: 200, maxChars: 25_000 }
 
+/**
+ * Run git in a scratch repository. Git exports `GIT_DIR` and friends to its
+ * hooks, so a suite run by the pre-push hook would otherwise `init` and
+ * `commit` inside the repository being pushed; only the scratch cwd decides.
+ */
+const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')))
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe', env: gitEnv })
+
 /** Lay out a main repository and one linked worktree the way git does (without running git). */
 const fakeWorktree = (main, name = 'feat') => {
   const gitdir = join(main, '.git', 'worktrees', name)
@@ -58,11 +66,10 @@ test('projectRoots in a linked worktree adds the main repository after the workt
 
 test('projectRoots agrees with a worktree git itself created', async () => {
   const main = scratch()
-  const git = (...args) => execFileSync('git', args, { cwd: main, stdio: 'pipe' })
-  git('init', '-q')
-  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'root')
+  git(main, 'init', '-q')
+  git(main, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'root')
   const wt = join(main, '.claude', 'worktrees', 'feat')
-  git('worktree', 'add', '-q', wt)
+  git(main, 'worktree', 'add', '-q', wt)
   assert.deepEqual(await projectRoots(join(wt, 'sub')), [wt, main, join(wt, 'sub')])
 })
 
@@ -74,7 +81,6 @@ test('mainRootOfWorktree gives up where git stores the main repository elsewhere
   assert.equal(await mainRootOfWorktree(join(dir, '.git')), undefined)
   const main = scratch()
   const separate = join(scratch(), 'meta')
-  const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' })
   git(main, 'init', '-q', `--separate-git-dir=${separate}`)
   git(main, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'root')
   const wt = join(scratch(), 'feat')
