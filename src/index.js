@@ -60,7 +60,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { locateMemoryIndex, locateOwnIndex, ownMemoryDir, readIndex, renderMemoryMessage, renderWithdrawnMessage } from './locate.js'
-import { MEMORY_TYPES, deleteMemory, isMemoryName, saveMemory } from './store.js'
+import { MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, saveMemory } from './store.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'claude-memory'
@@ -323,9 +323,23 @@ export function apply(ctx, config) {
         if (cwd === undefined) throw new Error(`${exec.name ?? 'memory tool'} needs a session with a working directory; this call has none`)
         return ownMemoryDir(cwd, ownMemoryHome)
       }
-      const capNote = (indexLines) => indexLines > limits.maxLines
-        ? ` The index now has ${indexLines} lines; only the first ${limits.maxLines} are loaded, so merge or delete entries.`
-        : ''
+      /**
+       * Claude Code measures the index after every write: near a cap it
+       * reminds the model to shorten it; over a cap the write stands but the
+       * tool reports an error, because the excess is dropped on the next load.
+       */
+      const indexVerdict = (saved) => {
+        const size = `${saved.indexLines} lines / ${saved.indexChars} characters`
+        const caps = `${limits.maxLines} lines / ${limits.maxChars} characters`
+        switch (judgeIndex(saved, limits)) {
+          case 'over':
+            throw new Error(`the memory was saved, but this write left the index ${saved.indexPath} at ${size}, over its ${caps} read limit; everything past the limit is dropped on the next load. Shorten the index now: merge overlapping memories with memory_save under one name and memory_delete the rest, and drop stale entries.`)
+          case 'near':
+            return ` The index is at ${size}, near its ${caps} read limit: keep one line per entry, and merge or drop stale entries.`
+          default:
+            return ''
+        }
+      }
       try {
         toolCtx.tools.register(defineTool({
           name: SAVE_TOOL_NAME,
@@ -346,9 +360,11 @@ export function apply(ctx, config) {
                 path: { type: 'string', required: true },
                 created: { type: 'boolean', required: true },
                 indexLines: { type: 'integer', required: true },
+                indexChars: { type: 'integer', required: true },
+                indexNote: { type: 'string', required: true },
               },
             },
-            render: (args, value) => [{ type: 'text', text: `${value.created ? 'Saved' : 'Updated'} memory ${args.name} at ${value.path}.${capNote(value.indexLines)}` }],
+            render: (args, value) => [{ type: 'text', text: `${value.created ? 'Saved' : 'Updated'} memory ${args.name} at ${value.path}.${value.indexNote}` }],
           },
           isConcurrencySafe: () => false,
           async execute(args, exec) {
@@ -356,7 +372,7 @@ export function apply(ctx, config) {
             if (args.content.trim().length === 0) throw new Error('content must not be empty')
             const dir = await dirOf(exec)
             const saved = await saveMemory(dir, { ...args, sessionId: String(exec.agent.session.id) })
-            return { path: saved.path, created: saved.created, indexLines: saved.indexLines }
+            return { path: saved.path, created: saved.created, indexLines: saved.indexLines, indexChars: saved.indexChars, indexNote: indexVerdict(saved) }
           },
         }))
         toolCtx.tools.register(defineTool({

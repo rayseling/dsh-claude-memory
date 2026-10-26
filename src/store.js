@@ -162,8 +162,9 @@ function serialized(dir, task) {
  * Create or replace one memory and its index line.
  * @param {string} dir - the project's own memory directory, created when missing.
  * @param {{ name: string, description: string, type: string, title: string, hook: string, content: string, sessionId: string, modified?: Date }} memory
- * @returns {Promise<{ path: string, indexPath: string, created: boolean, indexLines: number }>} where the file went,
- *   whether it is new (no index line pointed at it before), and the index's line count after the write.
+ * @returns {Promise<{ path: string, indexPath: string, created: boolean, indexLines: number, indexChars: number }>} where the file
+ *   went, whether it is new (no index line pointed at it before), and the index's line and UTF-16 code unit counts after the
+ *   write, which the caller measures against the read caps the way Claude Code does after every index write.
  */
 export function saveMemory(dir, memory) {
   return serialized(dir, async () => {
@@ -173,8 +174,22 @@ export function saveMemory(dir, memory) {
     await writeAtomic(path, renderMemoryFile({ ...memory, modified: memory.modified ?? new Date() }))
     const index = upsertIndexLine(await readOrEmpty(indexPath), memory.name, renderIndexLine(memory))
     await writeAtomic(indexPath, index.text)
-    return { path, indexPath, created: !index.replaced, indexLines: index.lines }
+    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.length }
   })
+}
+
+/**
+ * Judge an index against the read caps the way Claude Code does after a
+ * write: over either cap, everything past it is dropped on the next load;
+ * near either cap (nine tenths or more), the index wants shortening.
+ * @param {{ indexLines: number, indexChars: number }} index - counts after the write.
+ * @param {{ maxLines: number, maxChars: number }} limits - the read caps.
+ * @returns {'ok' | 'near' | 'over'}
+ */
+export function judgeIndex({ indexLines, indexChars }, { maxLines, maxChars }) {
+  if (indexLines > maxLines || indexChars > maxChars) return 'over'
+  if (indexLines * 10 >= maxLines * 9 || indexChars * 10 >= maxChars * 9) return 'near'
+  return 'ok'
 }
 
 /**

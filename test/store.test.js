@@ -9,7 +9,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import {
-  MEMORY_TYPES, deleteMemory, isMemoryName, removeIndexLine, renderIndexLine, renderMemoryFile, saveMemory, upsertIndexLine,
+  MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, removeIndexLine, renderIndexLine, renderMemoryFile, saveMemory, upsertIndexLine,
 } from '../src/store.js'
 import { Config, DELETE_TOOL_NAME, SAVE_TOOL_NAME, apply } from '../src/index.js'
 import { slugOf } from '../src/locate.js'
@@ -20,6 +20,16 @@ test('memory names are lower-case kebab-case', () => {
   for (const ok of ['a', 'reply-in-chinese', 'dsh-0-2-1']) assert.equal(isMemoryName(ok), true, ok)
   for (const bad of ['', 'Reply', 'a--b', '-a', 'a-', 'a_b', 'a b', 'a/b', '../x', 'a.md', 'x'.repeat(101)]) assert.equal(isMemoryName(bad), false, bad)
   assert.deepEqual([...MEMORY_TYPES], ['user', 'feedback', 'project', 'reference'])
+})
+
+test('judgeIndex is ok below nine tenths of both caps, near from nine tenths, over past either cap', () => {
+  const limits = { maxLines: 200, maxChars: 25_000 }
+  assert.equal(judgeIndex({ indexLines: 179, indexChars: 22_499 }, limits), 'ok')
+  assert.equal(judgeIndex({ indexLines: 180, indexChars: 10 }, limits), 'near')
+  assert.equal(judgeIndex({ indexLines: 10, indexChars: 22_500 }, limits), 'near')
+  assert.equal(judgeIndex({ indexLines: 200, indexChars: 25_000 }, limits), 'near', 'exactly at the cap still loads in full')
+  assert.equal(judgeIndex({ indexLines: 201, indexChars: 10 }, limits), 'over')
+  assert.equal(judgeIndex({ indexLines: 10, indexChars: 25_001 }, limits), 'over')
 })
 
 test('renderMemoryFile writes Claude Code frontmatter with the host-filled fields and a trimmed body', () => {
@@ -110,7 +120,7 @@ const text = (result) => result.content.filter((block) => block.type === 'text')
 test('memory_save and memory_delete write the calling session\'s own store through the real tool runtime', async () => {
   const ownHome = scratch()
   const project = scratch()
-  const ctx = await mountWithTools({ ownMemory: true, ownMemoryHome: ownHome, maxLines: 2 })
+  const ctx = await mountWithTools({ ownMemory: true, ownMemoryHome: ownHome, maxLines: 4 })
   assert.deepEqual(ctx.tools.schemas().map((schema) => schema.name).filter((name) => name.startsWith('memory_')).sort(), [DELETE_TOOL_NAME, SAVE_TOOL_NAME])
   const saveSchema = ctx.tools.schemas().find((schema) => schema.name === SAVE_TOOL_NAME)
   assert.deepEqual(Object.keys(saveSchema.parameters.properties).sort(), ['content', 'description', 'hook', 'name', 'title', 'type'])
@@ -121,14 +131,22 @@ test('memory_save and memory_delete write the calling session\'s own store throu
   const dir = join(ownHome, slugOf(project))
   const saved = await call(ctx, SAVE_TOOL_NAME, { name: 'deploy-host', type: 'project', title: 'Deploy host', description: 'd', hook: 'mini', content: 'body' }, agent)
   assert.equal(saved.isError, false, JSON.stringify(saved))
-  assert.deepEqual(saved.value, { path: join(dir, 'deploy-host.md'), created: true, indexLines: 1 })
+  const indexText = '- [Deploy host](deploy-host.md) — mini\n'
+  assert.deepEqual(saved.value, { path: join(dir, 'deploy-host.md'), created: true, indexLines: 1, indexChars: indexText.length, indexNote: '' })
   assert.equal(text(saved), `Saved memory deploy-host at ${join(dir, 'deploy-host.md')}.`)
   assert.match(readFileSync(join(dir, 'deploy-host.md'), 'utf8'), /originSessionId: memory-tool-1\n/)
-  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Deploy host](deploy-host.md) — mini\n')
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), indexText)
 
-  for (const name of ['two', 'three']) await call(ctx, SAVE_TOOL_NAME, { name, type: 'user', title: name, description: 'd', hook: 'h', content: 'c' }, agent)
-  const over = await call(ctx, SAVE_TOOL_NAME, { name: 'four', type: 'user', title: 'four', description: 'd', hook: 'h', content: 'c' }, agent)
-  assert.match(text(over), /The index now has 4 lines; only the first 2 are loaded/)
+  for (const name of ['two', 'three']) assert.equal((await call(ctx, SAVE_TOOL_NAME, { name, type: 'user', title: name, description: 'd', hook: 'h', content: 'c' }, agent)).value.indexNote, '')
+  const near = await call(ctx, SAVE_TOOL_NAME, { name: 'four', type: 'user', title: 'four', description: 'd', hook: 'h', content: 'c' }, agent)
+  assert.equal(near.isError, false)
+  assert.match(text(near), /The index is at 4 lines \/ \d+ characters, near its 4 lines \/ 25000 characters read limit: keep one line per entry/)
+  const over = await call(ctx, SAVE_TOOL_NAME, { name: 'five', type: 'user', title: 'five', description: 'd', hook: 'h', content: 'c' }, agent)
+  assert.equal(over.isError, true, 'over the cap the tool reports an error')
+  assert.match(text(over), /the memory was saved, but this write left the index .*MEMORY.md at 5 lines \/ \d+ characters, over its 4 lines \/ 25000 characters read limit; everything past the limit is dropped on the next load/)
+  assert.ok(existsSync(join(dir, 'five.md')), 'the write itself stands')
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean).length, 5)
+  assert.equal((await call(ctx, DELETE_TOOL_NAME, { name: 'five' }, agent)).isError, false)
 
   const badName = await call(ctx, SAVE_TOOL_NAME, { name: 'Bad Name', type: 'user', title: 't', description: 'd', hook: 'h', content: 'c' }, agent)
   assert.equal(badName.isError, true)
