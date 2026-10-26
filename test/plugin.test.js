@@ -98,7 +98,11 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
   assert.equal(modeDefinition.key, MODE_PROJECTION_KEY)
   assert.equal(modeDefinition.stateVersion, 3)
   assert.deepEqual(modeDefinition.init(), { read: {} })
-  assert.deepEqual(modeDefinition.wire.view({ read: { claude: false, dsh: true } }), { sources: [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }] })
+  assert.deepEqual(
+    modeDefinition.wire.view({ read: { claude: false, dsh: true } }),
+    { sources: config.ownMemory ? [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }] : [{ id: 'claude', enabled: false }] },
+    'the dsh source exists only with an own store',
+  )
   assert.deepEqual(modeDefinition.wire.viewSchema.parse({ sources: [{ id: 'dsh', enabled: false, extra: 1 }] }), { sources: [{ id: 'dsh', enabled: false }] })
   const commit = (session, event) => {
     for (const [key, unit] of definitions) {
@@ -120,10 +124,13 @@ async function run(listener, { agent, step = 1, claimed = [userMessage('hi')], e
   return listener({ agent, messages: claimed, turn: 1, step, signal: new AbortController().signal }, async () => decision)
 }
 
-/** Commit every message of an entered decision as `user/message` events from `seq` on. */
+/** Commit every message of an entered decision as `user/message` events from `seq` on; returns the next free seq. */
 function commitAll(commit, session, decision, seq) {
   let next = seq
-  for (const message of decision.messages) commit(session, { type: 'user/message', seq: next, time: next, surfaceOp: 'append', data: message })
+  for (const message of decision.messages) {
+    commit(session, { type: 'user/message', seq: next, time: next, surfaceOp: 'append', data: message })
+    next += 1
+  }
   return next
 }
 
@@ -198,11 +205,26 @@ test('mode state schema accepts on, off, and unset; the view schema only on and 
   assert.throws(() => modeViewSchema.parse({ enabled: true }))
 })
 
-test('the wire view resolves every unswitched source from readByDefault', () => {
-  const view = (config, state) => mount({ readByDefault: config }).modeDefinition.wire.view(state).sources
+test('the wire view resolves every unswitched source from readByDefault and lists dsh only with an own store', () => {
+  const view = (config, state) => mount({ readByDefault: config, ownMemory: true }).modeDefinition.wire.view(state).sources
   assert.deepEqual(view({ claude: false, dsh: true }, { read: {} }), [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }])
   assert.deepEqual(view({ claude: true, dsh: true }, { read: {} }), [{ id: 'claude', enabled: true }, { id: 'dsh', enabled: true }])
   assert.deepEqual(view({ claude: true, dsh: true }, { read: { dsh: false } }), [{ id: 'claude', enabled: true }, { id: 'dsh', enabled: false }])
+  assert.deepEqual(mount({ ownMemory: false }).modeDefinition.wire.view({ read: { dsh: true } }).sources, [{ id: 'claude', enabled: true }])
+})
+
+test('ownMemory: false refuses the dsh source in /memory and reports only claude', async () => {
+  const { commands } = mount({ ownMemory: false }, { withCommands: true })
+  const session = await newRealSession()
+  const agent = { session }
+  assert.deepEqual(commands[0].handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory read: claude on' })
+  assert.deepEqual(commands[0].handler({ agent, rawInput: 'dsh off' }), { kind: 'error', text: 'memory source dsh is not configured in this profile' })
+  assert.deepEqual(commands[0].handler({ agent, rawInput: 'off' }).text, 'Memory read off: claude', 'a bare off touches only configured sources')
+})
+
+test('a relative ownMemoryHome is refused at mount', () => {
+  assert.throws(() => mount({ ownMemory: true, ownMemoryHome: 'relative/memory' }), /ownMemoryHome must be an absolute path/)
+  mount({ ownMemory: false, ownMemoryHome: 'relative/memory' })
 })
 
 test('parses the /memory argument grammar', () => {
@@ -261,7 +283,7 @@ const commitModeEvents = (commit, session) => {
 }
 
 test('the /memory command appends one switch per changed source and reports state', async () => {
-  const { commands, commit, ctx } = mount({}, { withCommands: true })
+  const { commands, commit, ctx } = mount({ ownMemory: true }, { withCommands: true })
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
@@ -288,7 +310,7 @@ test('the /memory command appends one switch per changed source and reports stat
 })
 
 test('on the shipped default only dsh is read until /memory claude on, and "already" appends nothing', async () => {
-  const { commands, commit, ctx } = mount({ readByDefault: { claude: false, dsh: true } }, { withCommands: true })
+  const { commands, commit, ctx } = mount({ ownMemory: true, readByDefault: { claude: false, dsh: true } }, { withCommands: true })
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
@@ -621,7 +643,7 @@ test('with the own store on, a project without any memory still gets the directo
   const text = decision.messages[1].content[0].text
   assert.equal(decision.messages[1].source.path, join(ownHome, slugOf(project), 'MEMORY.md'))
   assert.ok(text.includes(`lives in ${join(ownHome, slugOf(project))}. It has no entries yet`))
-  assert.ok(text.includes('Save a memory in'))
+  assert.ok(text.includes('Save a memory with the `memory_save` tool'))
   assert.ok(!text.includes("Claude Code's memory index"))
   assert.deepEqual(logs.map(([level]) => level), ['info'])
 })
@@ -670,9 +692,14 @@ test('a memory the model writes is entered on the next turn, and a vanished Clau
   assert.equal(gone.messages[1].source.path, join(dir, 'MEMORY.md'))
 })
 
-test('a blank own index reads as no entries yet, and an unreadable one enters nothing', async () => {
+test('a blank own index reads as no entries yet; an unreadable one degrades to "not loaded" and keeps the Claude Code section', async () => {
   const { ownHome, project, ownPath } = seedOwn('\n\n')
-  const { listener, logs } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome })
+  const { home } = seedProject('- claude line\n')
+  // The Claude index lives under a different project root; point this project's slug at it.
+  const claudeDir = join(home, 'projects', slugOf(project), 'memory')
+  mkdirSync(claudeDir, { recursive: true })
+  writeFileSync(join(claudeDir, 'MEMORY.md'), '- claude line\n')
+  const { listener, logs } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: true, dsh: true } })
   const agent = fakeAgent({ cwd: project })
   assert.ok((await run(listener, { agent })).messages[1].content[0].text.includes('It has no entries yet'))
   const { chmodSync, readFileSync } = await import('node:fs')
@@ -682,8 +709,13 @@ test('a blank own index reads as no entries yet, and an unreadable one enters no
   try { readFileSync(ownPath) } catch { readable = false }
   try {
     if (!readable) {
-      assert.equal((await run(listener, { agent })).messages.length, 1)
-      assert.equal(logs.at(-1)[0], 'warn')
+      const degraded = await run(listener, { agent })
+      assert.equal(degraded.messages.length, 2)
+      const text = degraded.messages[1].content[0].text
+      assert.ok(text.includes('- claude line'), 'the Claude Code section still enters')
+      assert.ok(text.includes('is not loaded in this session'), 'the own section says the index is not loaded')
+      assert.ok(!text.includes('- [a](a.md)'))
+      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes(ownPath)), 'the unreadable index is warned about')
     }
   } finally {
     chmodSync(ownPath, 0o644)
@@ -712,9 +744,9 @@ test('with dsh read off the own store is still announced for writing, its index 
   const first = await run(listener, { agent })
   assert.equal(first.messages.length, 2, 'every source off, yet the write rules enter')
   const text = first.messages[1].content[0].text
-  assert.ok(text.includes(`Its index ${ownPath} is not loaded in this session; read it before saving`))
+  assert.ok(text.includes(`Its index ${ownPath} is not loaded in this session; \`cat\` it before saving`))
   assert.ok(!text.includes('- [Deploy host](deploy-host.md)'), 'the index content is not read')
-  assert.ok(text.includes('Save a memory in'))
+  assert.ok(text.includes('Save a memory with the `memory_save` tool'))
   commitAll(commit, agent.session, first, 1)
   assert.equal((await run(listener, { agent })).messages.length, 1, 'the static section is entered once')
   commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { source: 'dsh', enabled: true } })

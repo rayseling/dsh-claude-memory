@@ -36,6 +36,14 @@
  * cannot change them, and they persist across resume. Switching a source off
  * never removes an index already shown to the model.
  *
+ * Writes go through two tools this plugin registers, `memory_save` and
+ * `memory_delete` (see `./store.js`), which write from the server process:
+ * the host's file sandbox confines the model's own file tools to the
+ * workspace and temp directories, so the store under `~/.dsh` would otherwise
+ * need an approved escalation per write. The tools also fill the host-side
+ * frontmatter (`originSessionId`, `modified`), serialize index updates per
+ * directory, and can only reach the own store, never Claude Code's.
+ *
  * Topic files are not loaded: the framing tells the model to `cat` one only
  * when the task relates to it, which is Claude Code's on-demand rule.
  * Subagent sessions get nothing by default, as in Claude Code. A session
@@ -46,11 +54,13 @@
 
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
-import { locateMemoryIndex, locateOwnIndex, readIndex, renderMemoryMessage, renderWithdrawnMessage } from './locate.js'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import { locateMemoryIndex, locateOwnIndex, ownMemoryDir, readIndex, renderMemoryMessage, renderWithdrawnMessage } from './locate.js'
+import { MEMORY_TYPES, deleteMemory, isMemoryName, saveMemory } from './store.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'claude-memory'
@@ -67,7 +77,7 @@ const appendPluginRecord = dshSession.appendPluginRecord
 /** Session projection key owned by this plugin. */
 export const PROJECTION_KEY = 'claudeMemory'
 
-/** Session projection key holding the per-session on/off switch. */
+/** Session projection key holding the per-session, per-source read switches. */
 export const MODE_PROJECTION_KEY = 'claudeMemoryMode'
 
 /** Slash command name that toggles the switch. */
@@ -78,6 +88,10 @@ export const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
 
 /** Ignorable plugin-record type holding each accepted switch. */
 export const MODE_EVENT_TYPE = 'plugin:claude-memory/mode'
+
+/** Model-facing tool names for the own store. */
+export const SAVE_TOOL_NAME = 'memory_save'
+export const DELETE_TOOL_NAME = 'memory_delete'
 
 /**
  * Readable memory sources in display order. `claude` is the Claude Code index,
@@ -256,7 +270,12 @@ export function applyModeProjection(state, event) {
 export function apply(ctx, config) {
   const claudeHome = expandHome(config.claudeHome)
   const ownMemoryHome = expandHome(config.ownMemoryHome)
+  // A relative home would resolve against the server's cwd here and against
+  // the session's cwd in the model's eyes; refuse it at mount.
+  if (config.ownMemory && !isAbsolute(ownMemoryHome)) throw new TypeError(`claude-memory: ownMemoryHome must be an absolute path (got ${JSON.stringify(config.ownMemoryHome)})`)
   const limits = { maxLines: config.maxLines, maxChars: config.maxChars }
+  /** Sources this deployment can read: `dsh` exists only with an own store. */
+  const sources = SOURCES.filter((id) => id !== 'dsh' || config.ownMemory)
   /** Bounded index text per path, reused while the file's size and mtime hold. */
   const bounded = new Map()
   /** Paths already warned about per session, so a persistent read failure logs once. */
@@ -272,10 +291,10 @@ export function apply(ctx, config) {
 
   /**
    * The read switches a session is on: its own choice per source, else the
-   * configured default.
+   * configured default. A source this deployment lacks reads as off.
    * @returns {Record<string, boolean>} one entry per {@link SOURCES} id.
    */
-  const resolveRead = (mode) => Object.fromEntries(SOURCES.map((id) => [id, mode.read[id] ?? config.readByDefault[id]]))
+  const resolveRead = (mode) => Object.fromEntries(SOURCES.map((id) => [id, sources.includes(id) && (mode.read[id] ?? config.readByDefault[id])]))
   const sameRead = (a, b) => SOURCES.every((id) => a[id] === b[id])
 
   ctx.sessionProjections.register({
@@ -289,10 +308,89 @@ export function apply(ctx, config) {
       viewSchema: modeViewSchema,
       view: (state) => {
         const read = resolveRead(state)
-        return { sources: SOURCES.map((id) => ({ id, enabled: read[id] })) }
+        return { sources: sources.map((id) => ({ id, enabled: read[id] })) }
       },
     },
   })
+
+  // Optional: the write tools need the tool registry. Without it the store is
+  // announced read-only in effect; the framing still names the tools, so a
+  // host without `tools` should set ownMemory: false.
+  if (config.ownMemory) {
+    ctx.inject(['tools'], (toolCtx) => {
+      const dirOf = async (exec) => {
+        const cwd = exec.agent?.session?.header?.cwd
+        if (cwd === undefined) throw new Error(`${exec.name ?? 'memory tool'} needs a session with a working directory; this call has none`)
+        return ownMemoryDir(cwd, ownMemoryHome)
+      }
+      const capNote = (indexLines) => indexLines > limits.maxLines
+        ? ` The index now has ${indexLines} lines; only the first ${limits.maxLines} are loaded, so merge or delete entries.`
+        : ''
+      try {
+        toolCtx.tools.register(defineTool({
+          name: SAVE_TOOL_NAME,
+          description: 'Save one memory of this project into your own memory store (create it, or update the entry with the same name), and keep its index line current. Use it for facts a future session needs that the repository does not record; never for Claude Code\'s memory, which is read-only.',
+          parameters: {
+            name: { type: 'string', required: true, description: 'Stable kebab-case id, also the file name without .md; reuse an existing name to update that entry.' },
+            type: { type: 'string', required: true, enum: [...MEMORY_TYPES], description: 'user (who the user is, preferences) | feedback (a correction or confirmed approach, with its reason) | project (ongoing work, goals, constraints) | reference (URL, ticket, dashboard).' },
+            title: { type: 'string', required: true, description: 'Short title for the index line.' },
+            description: { type: 'string', required: true, description: 'One line a later session uses to judge relevance.' },
+            hook: { type: 'string', required: true, description: 'The index line\'s one-sentence hook after the title: the fact itself in brief.' },
+            content: { type: 'string', required: true, description: 'The memory body in Markdown: the fact with dates in full; for feedback and project, end with **Why:** and **How to apply:** lines; link related memories as [[name]].' },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                created: { type: 'boolean', required: true },
+                indexLines: { type: 'integer', required: true },
+              },
+            },
+            render: (args, value) => [{ type: 'text', text: `${value.created ? 'Saved' : 'Updated'} memory ${args.name} at ${value.path}.${capNote(value.indexLines)}` }],
+          },
+          isConcurrencySafe: () => false,
+          async execute(args, exec) {
+            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens), got ${JSON.stringify(args.name)}`)
+            if (args.content.trim().length === 0) throw new Error('content must not be empty')
+            const dir = await dirOf(exec)
+            const saved = await saveMemory(dir, { ...args, sessionId: String(exec.agent.session.id) })
+            return { path: saved.path, created: saved.created, indexLines: saved.indexLines }
+          },
+        }))
+        toolCtx.tools.register(defineTool({
+          name: DELETE_TOOL_NAME,
+          description: 'Delete one memory of yours from this project\'s own memory store and drop its index line. Only your own store; Claude Code\'s memory cannot be deleted from here.',
+          parameters: {
+            name: { type: 'string', required: true, description: 'The memory\'s name as it appears in the index link, without .md.' },
+          },
+          output: {
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                path: { type: 'string', required: true },
+                existed: { type: 'boolean', required: true },
+                indexLines: { type: 'integer', required: true },
+              },
+            },
+            render: (args, value) => [{ type: 'text', text: value.existed ? `Deleted memory ${args.name}.` : `No memory named ${args.name} in ${value.path.slice(0, value.path.lastIndexOf('/'))}; nothing to delete.` }],
+          },
+          isConcurrencySafe: () => false,
+          async execute(args, exec) {
+            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens), got ${JSON.stringify(args.name)}`)
+            const dir = await dirOf(exec)
+            const removed = await deleteMemory(dir, args.name)
+            return { path: removed.path, existed: removed.removedFile || removed.removedLines > 0, indexLines: removed.indexLines }
+          },
+        }))
+      } catch (error) {
+        // A name collision on an optional tool must not disable injection.
+        ctx.logger.warn(`claude-memory: cannot register the memory tools: ${error.message}`)
+      }
+    })
+  }
 
   // Optional: only a composed command surface can offer the switch. Injection
   // and the mode gate work without it, with every session on the configured
@@ -316,10 +414,12 @@ export function apply(ctx, config) {
           if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
           const read = resolveRead(mode)
           const describe = (ids) => ids.map((id) => `${id} ${read[id] ? 'on' : 'off'}`).join(', ')
-          if (request.action === 'status') return { kind: 'success', text: `Memory read: ${describe(SOURCES)}` }
+          if (request.action === 'status') return { kind: 'success', text: `Memory read: ${describe(sources)}` }
+          const unavailable = request.sources.filter((id) => !sources.includes(id))
+          if (unavailable.length > 0 && request.sources.length === unavailable.length) return { kind: 'error', text: `memory source ${unavailable.join(', ')} is not configured in this profile` }
           const position = request.enabled ? 'on' : 'off'
-          const changing = request.sources.filter((id) => read[id] !== request.enabled)
-          if (changing.length === 0) return { kind: 'success', text: `Memory read already ${position}: ${describe(request.sources)}` }
+          const changing = request.sources.filter((id) => sources.includes(id) && read[id] !== request.enabled)
+          if (changing.length === 0) return { kind: 'success', text: `Memory read already ${position}: ${describe(request.sources.filter((id) => sources.includes(id)))}` }
           let seq
           try {
             for (const source of changing) seq = appendPluginRecord(agent.session, MODE_EVENT_TYPE, { source, enabled: request.enabled })
@@ -373,21 +473,20 @@ export function apply(ctx, config) {
 
   /**
    * Locate the stores this session reads and read their indexes. The Claude
-   * Code index is located only when its switch is on. The own store, when
-   * configured, is always named so the model can write to it; its index is
-   * read only when the `dsh` switch is on, else the section says the index is
-   * not loaded. A store whose index cannot be inspected or read yields
-   * `undefined` for the whole result, so the turn enters nothing rather than
-   * a message missing a section it could not vouch for.
+   * Code index is located only when its switch is on; when it cannot be
+   * inspected or read the whole result is `undefined`, so the turn enters
+   * nothing rather than a message missing a section it could not vouch for.
+   * The own store, when configured, is always named so the model can write
+   * to it; its index is read only when the `dsh` switch is on, and an index
+   * that cannot be inspected or read degrades to "not loaded" (the model is
+   * told to read it before saving) so the Claude Code section still enters.
    * @param {Record<string, boolean>} read - resolved switches.
    * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean } } | undefined>}
    */
   const currentStores = async (session, cwd, signal, read) => {
     let located
-    let own
     try {
       located = read.claude ? await locateMemoryIndex(cwd, claudeHome) : undefined
-      own = config.ownMemory ? await locateOwnIndex(cwd, ownMemoryHome) : undefined
     } catch (error) {
       // The file may exist but cannot be inspected right now; say nothing rather than withdraw.
       warnOnce(session, cwd, `claude-memory: cannot inspect the memory index for ${cwd}: ${error.message}`)
@@ -400,12 +499,21 @@ export function apply(ctx, config) {
       if (index.kind === 'error') return undefined
       if (index.kind === 'text') stores.claude = { path: located.path, text: index.text, truncated: index.truncated }
     }
-    if (own !== undefined) {
-      stores.own = { path: own.path, truncated: false, loaded: read.dsh }
-      if (read.dsh && own.size !== undefined) {
-        const index = await currentIndex(session, own)
-        if (index.kind === 'error') return undefined
-        if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true }
+    if (config.ownMemory) {
+      let own
+      try {
+        own = await locateOwnIndex(cwd, ownMemoryHome, { stat: read.dsh })
+      } catch (error) {
+        // Without a canonical root or a stat there is no directory to vouch for; leave the section out this turn.
+        warnOnce(session, `${cwd}#own`, `claude-memory: cannot inspect the own memory index for ${cwd}: ${error.message}`)
+      }
+      if (own !== undefined) {
+        stores.own = { path: own.path, truncated: false, loaded: read.dsh }
+        if (read.dsh && own.size !== undefined) {
+          const index = await currentIndex(session, own)
+          if (index.kind === 'error') stores.own.loaded = false
+          else if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true }
+        }
       }
     }
     signal.throwIfAborted()
@@ -436,7 +544,7 @@ export function apply(ctx, config) {
       if (state.digest === null || state.path === null) return decision
       message = snapshotMessage(renderWithdrawnMessage(state.path), state.path)
     } else {
-      message = snapshotMessage(renderMemoryMessage(stores), stores.claude?.path ?? stores.own.path)
+      message = snapshotMessage(renderMemoryMessage({ ...stores, maxLines: limits.maxLines }), stores.claude?.path ?? stores.own.path)
     }
     if (state.digest === message.source.digest) return decision
     if (decision.messages.some((entry) => entry.source?.kind === SOURCE_KIND && entry.source.digest === message.source.digest)) return decision

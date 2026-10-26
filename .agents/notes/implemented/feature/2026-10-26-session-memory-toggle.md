@@ -25,7 +25,7 @@ Status: implemented
 
 ## Client half
 
-同一个包也声明 `dsh.client`(`platform: web`,inject `api-remotes` / `api-session-controller` / `client-locale` / `client-ui-conversation`),`exports["./client"]` 指向手写的 `src/client.js`。该文件是 `window.__ModuleLoader__.load({ id, factory })` 闭包,没有构建步骤;factory 只 `require('react')`,在 `conversation.input.right`(模型选择前的紧凑控件行)注册 `MemoryMenu`:一个"记忆"按钮,点开一个菜单,view 里每个来源一行、各自一个开关,点一行就通过 `ctx.remote.commands.execute` 执行 `/memory <source> on|off`。按钮文字列出正在读的来源("记忆: DSH + Claude Code"),都关着显示"记忆:关"。行从 view 派生,服务端加来源 client 不用改;来源名走 locale 键 `source.<id>`,没有译文时显示 id。client 插件 inject `slots`/`remote`/`remote.commands`/`sessions`/`locale`;`sessions.subagentAddress(sessionId)` 非空时不渲染;执行前用 `remote.commands.list` 校验 `definitionId`,避免 `/memory` 被同名命令遮蔽时触发别的插件。
+同一个包也声明 `dsh.client`(`platform: web`,inject `api-remotes` / `api-session-controller` / `client-locale` / `client-ui-conversation`),`exports["./client"]` 指向手写的 `src/client.js`。该文件是 `window.__ModuleLoader__.load({ id, factory })` 闭包,没有构建步骤;factory 只 `require('react')`,在 `conversation.input.right`(模型选择前的紧凑控件行)注册 `MemoryMenu`:一个"记忆"按钮,点开一个菜单,view 里每个来源一行、各自一个开关,点一行就通过 `ctx.remote.commands.execute` 执行 `/memory <source> on|off`。按钮文字列出正在读的来源("记忆: DSH + Claude Code"),都关着显示"记忆:关"。行从 view 派生,服务端加来源 client 不用改;来源名走 locale 键 `source.<id>`,没有译文时 locale 回退显示键名本身。client 插件 inject `slots`/`remote`/`remote.commands`/`sessions`/`locale`;`sessions.subagentAddress(sessionId)` 非空时不渲染;执行前用 `remote.commands.list` 校验 `definitionId`,避免 `/memory` 被同名命令遮蔽时触发别的插件。
 
 - 服务端 mode 投影的 `wire: { viewSchema, view }` 发 `{ sources: [{ id, enabled }] }`,客户端从 `useProjection('claudeMemoryMode')` 读;view 缺失时不渲染。
 - 文案走 client locale(namespace `claude-memory`),order 0;命令结果 `value.result.kind === "error"` 时把错误文本显示出来,不当作成功。
