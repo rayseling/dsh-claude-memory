@@ -115,29 +115,53 @@ test('client bundle registers the model-row pill and executes /memory', async ()
     commands.push(line)
     return Promise.resolve(null)
   }
-  const off = registration.component({
-    available: true, sessionId: 'session-1', useProjection: () => ({ enabled: false }), toggleMemory: toggle, t,
-  })
-  assert.equal(off.type, 'button')
-  assert.equal(off.props['aria-pressed'], false)
-  assert.equal(off.props.children, 'button.off')
-  off.props.onClick()
-  await Promise.resolve()
-  assert.equal(commands.at(-1), '/memory on')
+  const view = (sources) => () => ({ sources })
 
-  const on = registration.component({
-    available: true, sessionId: 'session-1', useProjection: () => ({ enabled: true }), toggleMemory: toggle, t,
+  // The fake useState never re-renders, so the menu is tested closed (the
+  // button) and open (rows) by rendering twice with a stateful useState.
+  const closed = registration.component({
+    available: true, sessionId: 'session-1', useProjection: view([{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }]), toggleMemory: toggle, t,
   })
-  assert.equal(on.props['aria-pressed'], true)
-  assert.equal(on.props.children, 'button.on')
-  on.props.onClick()
+  assert.equal(closed.type, 'span')
+  const [button, menu] = closed.props.children
+  assert.equal(button.type, 'button')
+  assert.equal(button.props['aria-expanded'], false)
+  assert.equal(button.props.children, 'button.label: source.dsh', 'the label names the sources being read')
+  assert.equal(menu, null)
+
+  const none = registration.component({
+    available: true, sessionId: 'session-1', useProjection: view([{ id: 'claude', enabled: false }, { id: 'dsh', enabled: false }]), toggleMemory: toggle, t,
+  })
+  assert.equal(none.props.children[0].props.children, 'button.none')
+
+  const openReact = { ...React, useState(initial) { return [typeof initial === 'boolean' ? true : initial, () => {}] } }
+  let openExports
+  globalThis.window = { __ModuleLoader__: { load({ factory }) { openExports = factory(() => openReact) } } }
+  await import('../src/client.js?open')
+  delete globalThis.window
+  let openRegistration
+  openExports.apply({ ...ctx, slots: { inject: (_name, fn) => fn(), register(definition, component) { openRegistration = { definition, component }; return () => {} } } })
+  const opened = openRegistration.component({
+    available: true, sessionId: 'session-1', useProjection: view([{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }, { id: 'future', enabled: true }]), toggleMemory: toggle, t,
+  })
+  const openMenu = opened.props.children[1]
+  assert.equal(openMenu.props.role, 'menu')
+  const rows = openMenu.props.children
+  assert.deepEqual(rows.map((row) => row.props.key), ['claude', 'dsh', 'future'], 'one row per source in the view, unknown ids included')
+  assert.deepEqual(rows.map((row) => row.props['aria-checked']), [false, true, true])
+  assert.equal(rows[0].props.children[0].props.children, 'source.claude')
+  assert.equal(rows[1].props.children[1].props.children, 'switch.on')
+  rows[0].props.onClick()
   await Promise.resolve()
-  assert.equal(commands.at(-1), '/memory off')
+  assert.equal(commands.at(-1), '/memory claude on')
+  rows[1].props.onClick()
+  await Promise.resolve()
+  assert.equal(commands.at(-1), '/memory dsh off')
 
   assert.equal(registration.component({
     available: true, sessionId: 'session-1', useProjection: () => undefined, toggleMemory: toggle, t,
   }), null)
   assert.equal(registration.component({
-    available: false, sessionId: 'session-2', useProjection: () => ({ enabled: true }), toggleMemory: toggle, t,
+    available: false, sessionId: 'session-2', useProjection: view([{ id: 'dsh', enabled: true }]), toggleMemory: toggle, t,
   }), null)
 })

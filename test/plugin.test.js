@@ -90,16 +90,16 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
       },
     },
   }
-  apply(ctx, Config({ enabledByDefault: true, ownMemory: false, ownMemoryHome: scratch(), ...config }))
+  apply(ctx, Config({ readByDefault: { claude: true, dsh: true }, ownMemory: false, ownMemoryHome: scratch(), ...config }))
   const definition = definitions.get(PROJECTION_KEY)
   const modeDefinition = definitions.get(MODE_PROJECTION_KEY)
   assert.equal(definition.key, PROJECTION_KEY)
   assert.equal(definition.stateVersion, 2)
   assert.equal(modeDefinition.key, MODE_PROJECTION_KEY)
-  assert.equal(modeDefinition.stateVersion, 2)
-  assert.deepEqual(modeDefinition.init(), { enabled: null })
-  assert.deepEqual(modeDefinition.wire.view({ enabled: false }), { enabled: false })
-  assert.deepEqual(modeDefinition.wire.viewSchema.parse({ enabled: false }), { enabled: false })
+  assert.equal(modeDefinition.stateVersion, 3)
+  assert.deepEqual(modeDefinition.init(), { read: {} })
+  assert.deepEqual(modeDefinition.wire.view({ read: { claude: false, dsh: true } }), { sources: [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }] })
+  assert.deepEqual(modeDefinition.wire.viewSchema.parse({ sources: [{ id: 'dsh', enabled: false, extra: 1 }] }), { sources: [{ id: 'dsh', enabled: false }] })
   const commit = (session, event) => {
     for (const [key, unit] of definitions) {
       const prior = ctx.sessionProjections.stateOf(session, key)
@@ -149,7 +149,8 @@ test('Config applies Claude Code defaults and validates caps', () => {
   assert.equal(resolved.maxLines, 200)
   assert.equal(resolved.maxChars, 25_000)
   assert.equal(resolved.includeSubagents, false)
-  assert.equal(resolved.enabledByDefault, false)
+  assert.deepEqual(resolved.readByDefault, { claude: false, dsh: true })
+  assert.deepEqual(Config({ readByDefault: { claude: true } }).readByDefault, { claude: true, dsh: true })
   assert.equal(resolved.ownMemory, true)
   assert.ok(resolved.claudeHome.endsWith('/.claude'))
   assert.ok(resolved.ownMemoryHome.endsWith('/.dsh/memory'))
@@ -185,40 +186,51 @@ test('projection fold records this plugin snapshots, ignores other events, and c
 })
 
 test('mode state schema accepts on, off, and unset; the view schema only on and off', () => {
-  assert.deepEqual(modeStateSchema.parse({ enabled: false, extra: 1 }), { enabled: false })
-  assert.deepEqual(modeStateSchema.parse({ enabled: true }), { enabled: true })
-  assert.deepEqual(modeStateSchema.parse({ enabled: null }), { enabled: null })
-  assert.throws(() => modeStateSchema.parse({ enabled: 'yes' }))
+  assert.deepEqual(modeStateSchema.parse({ read: { claude: false, future: true }, extra: 1 }), { read: { claude: false, future: true } }, 'unknown source ids survive')
+  assert.deepEqual(modeStateSchema.parse({ read: {} }), { read: {} })
+  assert.throws(() => modeStateSchema.parse({ read: { claude: 'yes' } }))
+  assert.throws(() => modeStateSchema.parse({ read: [] }))
+  assert.throws(() => modeStateSchema.parse({ enabled: true }), 'the 0.4.0 shape is not accepted; the checkpoint is recomputed from the log')
   assert.throws(() => modeStateSchema.parse({}))
   assert.throws(() => modeStateSchema.parse(null))
-  assert.deepEqual(modeViewSchema.parse({ enabled: true }), { enabled: true })
-  assert.throws(() => modeViewSchema.parse({ enabled: null }))
+  assert.deepEqual(modeViewSchema.parse({ sources: [] }), { sources: [] })
+  assert.throws(() => modeViewSchema.parse({ sources: [{ id: 'claude', enabled: null }] }))
+  assert.throws(() => modeViewSchema.parse({ enabled: true }))
 })
 
-test('the wire view resolves an unset switch from enabledByDefault', () => {
-  assert.deepEqual(mount({ enabledByDefault: false }).modeDefinition.wire.view({ enabled: null }), { enabled: false })
-  assert.deepEqual(mount({ enabledByDefault: true }).modeDefinition.wire.view({ enabled: null }), { enabled: true })
-  assert.deepEqual(mount({ enabledByDefault: true }).modeDefinition.wire.view({ enabled: false }), { enabled: false })
+test('the wire view resolves every unswitched source from readByDefault', () => {
+  const view = (config, state) => mount({ readByDefault: config }).modeDefinition.wire.view(state).sources
+  assert.deepEqual(view({ claude: false, dsh: true }, { read: {} }), [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }])
+  assert.deepEqual(view({ claude: true, dsh: true }, { read: {} }), [{ id: 'claude', enabled: true }, { id: 'dsh', enabled: true }])
+  assert.deepEqual(view({ claude: true, dsh: true }, { read: { dsh: false } }), [{ id: 'claude', enabled: true }, { id: 'dsh', enabled: false }])
 })
 
 test('parses the /memory argument grammar', () => {
-  assert.equal(parseMemoryCommand(''), 'status')
-  assert.equal(parseMemoryCommand('  '), 'status')
-  assert.equal(parseMemoryCommand(' off '), 'off')
-  assert.equal(parseMemoryCommand('ON'), 'on')
-  assert.equal(parseMemoryCommand('status'), 'status')
+  assert.deepEqual(parseMemoryCommand(''), { action: 'status' })
+  assert.deepEqual(parseMemoryCommand('  '), { action: 'status' })
+  assert.deepEqual(parseMemoryCommand('status'), { action: 'status' })
+  assert.deepEqual(parseMemoryCommand(' off '), { action: 'set', sources: ['claude', 'dsh'], enabled: false })
+  assert.deepEqual(parseMemoryCommand('ON'), { action: 'set', sources: ['claude', 'dsh'], enabled: true })
+  assert.deepEqual(parseMemoryCommand('dsh off'), { action: 'set', sources: ['dsh'], enabled: false })
+  assert.deepEqual(parseMemoryCommand('Claude  ON'), { action: 'set', sources: ['claude'], enabled: true })
   assert.equal(parseMemoryCommand('bogus'), undefined)
+  assert.equal(parseMemoryCommand('bogus on'), undefined)
   assert.equal(parseMemoryCommand('off always'), undefined)
+  assert.equal(parseMemoryCommand('dsh claude on'), undefined)
 })
 
-test('mode projection folds only switch events and ignores surface replacements', () => {
-  const unset = { enabled: null }
+test('mode projection folds switch events per source, reads 0.4.0 records as claude, and ignores surface replacements', () => {
+  const unset = { read: {} }
   assert.equal(applyModeProjection(unset, { type: 'command/run', data: { name: COMMAND_NAME, args: 'off' } }), unset)
-  const off = applyModeProjection(unset, { type: MODE_EVENT_TYPE, data: { enabled: false } })
-  assert.deepEqual(off, { enabled: false })
-  assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: { enabled: false } }), off)
-  assert.equal(applyModeProjection(off, { type: MODE_EVENT_TYPE, data: {} }), off)
-  assert.equal(applyModeProjection(off, { type: 'user/message', surfaceOp: { op: 'replace', startSeq: 1, endSeq: 9 }, data: userMessage('x') }), off)
+  const legacy = applyModeProjection(unset, { type: MODE_EVENT_TYPE, data: { enabled: false } })
+  assert.deepEqual(legacy, { read: { claude: false } })
+  const dshOff = applyModeProjection(legacy, { type: MODE_EVENT_TYPE, data: { source: 'dsh', enabled: false } })
+  assert.deepEqual(dshOff, { read: { claude: false, dsh: false } })
+  assert.equal(applyModeProjection(dshOff, { type: MODE_EVENT_TYPE, data: { source: 'dsh', enabled: false } }), dshOff)
+  assert.equal(applyModeProjection(dshOff, { type: MODE_EVENT_TYPE, data: {} }), dshOff)
+  assert.equal(applyModeProjection(dshOff, { type: MODE_EVENT_TYPE, data: { source: 7, enabled: true } }), dshOff)
+  assert.deepEqual(applyModeProjection(dshOff, { type: MODE_EVENT_TYPE, data: { source: 'future', enabled: true } }), { read: { claude: false, dsh: false, future: true } })
+  assert.equal(applyModeProjection(dshOff, { type: 'user/message', surfaceOp: { op: 'replace', startSeq: 1, endSeq: 9 }, data: userMessage('x') }), dshOff)
 })
 
 test('registers /memory only when a command surface is composed', () => {
@@ -229,7 +241,7 @@ test('registers /memory only when a command surface is composed', () => {
   const command = withCommands.commands[0]
   assert.equal(command.name, COMMAND_NAME)
   assert.equal(command.definitionId, COMMAND_DEFINITION_ID)
-  assert.equal(command.input.hint, 'on|off|status')
+  assert.equal(command.input.hint, '[claude|dsh] on|off | status')
 })
 
 test('a command registration failure is logged and leaves injection working', async () => {
@@ -243,42 +255,50 @@ test('a command registration failure is logged and leaves injection working', as
   assert.equal((await run(listener, { agent: fakeAgent({ cwd: project }) })).messages.length, 2)
 })
 
-test('the /memory command appends the switch and reports state', async () => {
+/** Commit every mode record the command appended to a real session (folding is idempotent). */
+const commitModeEvents = (commit, session) => {
+  for (const event of session.snapshotEvents()) if (event.type === MODE_EVENT_TYPE) commit(session, event)
+}
+
+test('the /memory command appends one switch per changed source and reports state', async () => {
   const { commands, commit, ctx } = mount({}, { withCommands: true })
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is on' })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: {} })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory read: claude on, dsh on' })
   const off = command.handler({ agent, rawInput: 'off' })
   assert.equal(off.kind, 'success')
-  assert.equal(off.text, 'Memory off')
+  assert.equal(off.text, 'Memory read off: claude, dsh')
   assert.ok(Number.isInteger(off.sourceEventSeq))
-  commit(session, lastModeEvent(session))
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: false })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is off' })
-  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Memory is already off' })
-  const on = command.handler({ agent, rawInput: 'on' })
-  assert.equal(on.kind, 'success')
-  assert.equal(on.text, 'Memory on')
-  assert.ok(Number.isInteger(on.sourceEventSeq))
-  commit(session, lastModeEvent(session))
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
-  assert.deepEqual(command.handler({ agent, rawInput: 'bogus' }), { kind: 'error', text: 'usage: /memory on|off|status' })
+  assert.deepEqual(session.snapshotEvents().filter((event) => event.type === MODE_EVENT_TYPE).map((event) => event.data), [{ source: 'claude', enabled: false }, { source: 'dsh', enabled: false }])
+  commitModeEvents(commit, session)
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: { claude: false, dsh: false } })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory read: claude off, dsh off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Memory read already off: claude off, dsh off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'dsh off' }), { kind: 'success', text: 'Memory read already off: dsh off' })
+  const dshOn = command.handler({ agent, rawInput: 'dsh on' })
+  assert.equal(dshOn.kind, 'success')
+  assert.equal(dshOn.text, 'Memory read on: dsh')
+  assert.ok(Number.isInteger(dshOn.sourceEventSeq))
+  commitModeEvents(commit, session)
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: { claude: false, dsh: true } })
+  assert.equal(command.handler({ agent, rawInput: 'on' }).text, 'Memory read on: claude', 'a bare on switches only the sources still off')
+  assert.deepEqual(command.handler({ agent, rawInput: 'bogus' }), { kind: 'error', text: 'usage: /memory [claude|dsh] on|off | status' })
 })
 
-test('on the shipped default the switch is off until /memory on, and "already off" appends nothing', async () => {
-  const { commands, commit, ctx } = mount({ enabledByDefault: false }, { withCommands: true })
+test('on the shipped default only dsh is read until /memory claude on, and "already" appends nothing', async () => {
+  const { commands, commit, ctx } = mount({ readByDefault: { claude: false, dsh: true } }, { withCommands: true })
   const command = commands[0]
   const session = await newRealSession()
   const agent = { session }
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is off' })
-  assert.deepEqual(command.handler({ agent, rawInput: 'off' }), { kind: 'success', text: 'Memory is already off' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory read: claude off, dsh on' })
+  assert.deepEqual(command.handler({ agent, rawInput: 'claude off' }), { kind: 'success', text: 'Memory read already off: claude off' })
   assert.equal(lastModeEvent(session), undefined)
-  assert.equal(command.handler({ agent, rawInput: 'on' }).kind, 'success')
-  commit(session, lastModeEvent(session))
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
-  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory is on' })
+  assert.equal(command.handler({ agent, rawInput: 'claude on' }).kind, 'success')
+  commitModeEvents(commit, session)
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: { claude: true } })
+  assert.deepEqual(command.handler({ agent, rawInput: 'status' }), { kind: 'success', text: 'Memory read: claude on, dsh on' })
 })
 
 test('a throwing switch append leaves the mode unchanged and reports an error', () => {
@@ -288,7 +308,7 @@ test('a throwing switch append leaves the mode unchanged and reports an error', 
   const result = command.handler({ agent: { session }, rawInput: 'off' })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /session log rejected/)
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: {} })
   assert.match(logs.at(-1)[1], /cannot store the memory switch/)
 })
 
@@ -301,20 +321,20 @@ test('the real projection service restores the switch from the committed log', a
   await new Promise((resolve) => setTimeout(resolve, 0))
   const session = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`))
   const agent = { id: session.id, session }
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: null })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: {} })
   const execution = await ctx.commands.execute(agent, '/memory on', [], new AbortController().signal)
   assert.ok(execution)
   assert.equal(execution.result.kind, 'success')
   assert.ok(Number.isInteger(execution.result.sourceEventSeq))
-  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { enabled: true })
+  assert.deepEqual(ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY), { read: { claude: true } }, 'dsh already reads by default, so only claude is switched')
   assert.ok(session.snapshotEvents().some((event) => event.type === MODE_EVENT_TYPE && event.ignorable === true))
   const restored = ctx.sessions.create(SessionId(`memory-real-${++sessionCounter}`), { seed: session.snapshotEvents() })
-  assert.deepEqual(ctx.sessionProjections.stateOf(restored, MODE_PROJECTION_KEY), { enabled: true })
+  assert.deepEqual(ctx.sessionProjections.stateOf(restored, MODE_PROJECTION_KEY), { read: { claude: true } })
 })
 
-test('on the shipped default a session enters nothing until /memory on', async () => {
+test('on the shipped default a session enters no Claude Code index until /memory claude on', async () => {
   const { home, project } = seedProject()
-  const { listener, commit } = mount({ claudeHome: home, enabledByDefault: false })
+  const { listener, commit } = mount({ claudeHome: home, readByDefault: { claude: false, dsh: true } })
   const agent = fakeAgent({ cwd: project })
   assert.equal((await run(listener, { agent })).messages.length, 1)
   commit(agent.session, { type: MODE_EVENT_TYPE, seq: 1, data: { enabled: true } })
@@ -434,7 +454,7 @@ test('a switch that lands after the initial check suppresses the injection', asy
   ctx.sessionProjections.stateOf = (session, key) => {
     if (key === MODE_PROJECTION_KEY) {
       modeReads += 1
-      if (modeReads === 2) return { enabled: false }
+      if (modeReads === 2) return { read: { claude: false } }
     }
     return original(session, key)
   }
@@ -683,6 +703,45 @@ test('the own store is shared by every worktree of a repository', async () => {
   const fromMain = await run(listener, { agent: { session: { id: 'session-main', header: { cwd: main } } } })
   assert.equal(fromWorktree.messages[1].source.path, join(ownHome, slugOf(main), 'MEMORY.md'))
   assert.equal(fromWorktree.messages[1].source.digest, fromMain.messages[1].source.digest)
+})
+
+test('with dsh read off the own store is still announced for writing, its index unread', async () => {
+  const { ownHome, project, ownPath } = seedOwn()
+  const { listener, commit } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: false, dsh: false } })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.equal(first.messages.length, 2, 'every source off, yet the write rules enter')
+  const text = first.messages[1].content[0].text
+  assert.ok(text.includes(`Its index ${ownPath} is not loaded in this session; read it before saving`))
+  assert.ok(!text.includes('- [Deploy host](deploy-host.md)'), 'the index content is not read')
+  assert.ok(text.includes('Save a memory in'))
+  commitAll(commit, agent.session, first, 1)
+  assert.equal((await run(listener, { agent })).messages.length, 1, 'the static section is entered once')
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { source: 'dsh', enabled: true } })
+  const on = await run(listener, { agent })
+  assert.equal(on.messages.length, 2)
+  assert.ok(on.messages[1].content[0].text.includes('- [Deploy host](deploy-host.md)'))
+})
+
+test('with every source off and no own store, a turn enters nothing', async () => {
+  const { home, project } = seedProject()
+  const { listener } = mount({ claudeHome: home, readByDefault: { claude: false, dsh: false } })
+  assert.equal((await run(listener, { agent: fakeAgent({ cwd: project }) })).messages.length, 1)
+})
+
+test('switching claude off mid-session drops its section from the next message instead of withdrawing', async () => {
+  const { home, project } = seedProject('- one\n')
+  const ownHome = scratch()
+  const { listener, commit } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.ok(first.messages[1].content[0].text.includes('- one'))
+  commitAll(commit, agent.session, first, 1)
+  commit(agent.session, { type: MODE_EVENT_TYPE, seq: 10, data: { source: 'claude', enabled: false } })
+  const next = await run(listener, { agent })
+  assert.equal(next.messages.length, 2)
+  assert.ok(!next.messages[1].content[0].text.includes('- one'))
+  assert.ok(!next.messages[1].content[0].text.includes('no longer available'))
 })
 
 test('ownMemory: false keeps the Claude Code index alone, and ~ expands in ownMemoryHome', async () => {

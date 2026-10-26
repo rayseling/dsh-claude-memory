@@ -25,13 +25,15 @@
  * enters as a newer snapshot; an index that disappeared after being shown
  * enters a withdrawal snapshot.
  *
- * A second projection (`claudeMemoryMode`) holds the per-session on/off
- * switch. A session that never ran `/memory on|off` sits on the configured
- * `enabledByDefault` (off unless the profile says otherwise); the command
- * appends one ignorable `plugin:claude-memory/mode` record per accepted
- * switch. While the switch is off, a turn reads no memory file and enters
- * nothing. The switch is independent of the snapshot state, so a surface
- * replacement cannot change it, and it persists across resume. Turning it off
+ * A second projection (`claudeMemoryMode`) holds the per-session read
+ * switches, one per memory source (`claude`, `dsh`). A source the session
+ * never switched sits on the configured `readByDefault`; `/memory <source>
+ * on|off` appends one ignorable `plugin:claude-memory/mode` record per
+ * accepted switch. A source switched off is not read and its index is not
+ * entered. Writing is not a switch: whenever the own store is configured, the
+ * model is told where it is and how to write to it, index loaded or not. The
+ * switches are independent of the snapshot state, so a surface replacement
+ * cannot change them, and they persist across resume. Switching a source off
  * never removes an index already shown to the model.
  *
  * Topic files are not loaded: the framing tells the model to `cat` one only
@@ -77,7 +79,15 @@ export const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
 /** Ignorable plugin-record type holding each accepted switch. */
 export const MODE_EVENT_TYPE = 'plugin:claude-memory/mode'
 
-/** Plugin configuration; every field but `enabledByDefault` and the own store's has Claude Code's own value as default. */
+/**
+ * Readable memory sources in display order. `claude` is the Claude Code index,
+ * `dsh` the harness's own store. A further harness's memory is added here,
+ * in `readByDefault`, and in `currentStores`; state, command, and client rows
+ * follow the list.
+ */
+export const SOURCES = Object.freeze(['claude', 'dsh'])
+
+/** Plugin configuration; every field but `readByDefault` and the own store's has Claude Code's own value as default. */
 export const Config = z.object({
   /** Claude Code configuration directory holding `projects/`. A leading `~/` expands to the home directory. */
   claudeHome: z.string().default(join(homedir(), '.claude')),
@@ -91,8 +101,11 @@ export const Config = z.object({
   maxChars: z.number().step(1).min(1).default(25_000),
   /** Enter memory into sessions a subagent owns; Claude Code gives subagents none. */
   includeSubagents: z.boolean().default(false),
-  /** Switch position of a session that never ran `/memory on|off`. Claude Code always loads; this plugin waits to be asked. */
-  enabledByDefault: z.boolean().default(false),
+  /** Read switch of each source for a session that never switched it. Claude Code always loads its own; this plugin waits to be asked for it. */
+  readByDefault: z.object({
+    claude: z.boolean().default(false),
+    dsh: z.boolean().default(true),
+  }),
 })
 
 /**
@@ -112,14 +125,19 @@ function digestOf(text) {
 }
 
 /**
- * Parse the `/memory` argument grammar. An empty argument asks for status.
+ * Parse the `/memory` argument grammar: `[status]`, `<source> on|off`, or a
+ * bare `on|off` that addresses every source.
  * @param {string} rawInput - text after the command name.
- * @returns {'on' | 'off' | 'status' | undefined} the requested action, or undefined for an unknown argument.
+ * @returns {{ action: 'status' } | { action: 'set', sources: string[], enabled: boolean } | undefined} the
+ *   request, or undefined for an unknown argument.
  */
 export function parseMemoryCommand(rawInput) {
-  const action = rawInput.trim().toLowerCase()
-  if (action === '') return 'status'
-  return action === 'on' || action === 'off' || action === 'status' ? action : undefined
+  const words = rawInput.trim().toLowerCase().split(/\s+/).filter((word) => word !== '')
+  if (words.length === 0 || (words.length === 1 && words[0] === 'status')) return { action: 'status' }
+  const position = words.at(-1)
+  if ((position !== 'on' && position !== 'off') || words.length > 2) return undefined
+  if (words.length === 1) return { action: 'set', sources: [...SOURCES], enabled: position === 'on' }
+  return SOURCES.includes(words[0]) ? { action: 'set', sources: [words[0]], enabled: position === 'on' } : undefined
 }
 
 /**
@@ -147,34 +165,41 @@ export const projectionStateSchema = {
 const EMPTY_STATE = Object.freeze({ seq: null, digest: null, path: null })
 
 /**
- * Validator for the persisted on/off switch (plain JSON). `null` records that
- * the session never ran `/memory on|off`, so `enabledByDefault` decides; the
- * default lives in configuration, not in the state, so a changed default
- * reaches every undecided session without touching stored checkpoints.
- * @type {{ parse(value: unknown): { enabled: boolean | null } }}
+ * Validator for the persisted read switches (plain JSON): `read` holds only
+ * the sources the session switched explicitly, so a source missing from it
+ * takes `readByDefault`; the default lives in configuration, not in the
+ * state, so a changed default reaches every undecided session without
+ * touching stored checkpoints. Keys outside {@link SOURCES} are kept, so a
+ * source added later does not invalidate older checkpoints.
+ * @type {{ parse(value: unknown): { read: Record<string, boolean> } }}
  */
 export const modeStateSchema = {
   parse(value) {
-    const ok = value !== null && typeof value === 'object' && (value.enabled === null || typeof value.enabled === 'boolean')
+    const read = value?.read
+    const ok = read !== null && typeof read === 'object' && !Array.isArray(read)
+      && Object.values(read).every((enabled) => typeof enabled === 'boolean')
     if (!ok) throw new TypeError(`claude-memory: invalid mode state ${JSON.stringify(value)}`)
-    return { enabled: value.enabled }
+    return { read: { ...read } }
   },
 }
 
 /**
- * Validator for the client view of the switch: the resolved position only.
- * @type {{ parse(value: unknown): { enabled: boolean } }}
+ * Validator for the client view of the switches: every source with its
+ * resolved position, in display order.
+ * @type {{ parse(value: unknown): { sources: { id: string, enabled: boolean }[] } }}
  */
 export const modeViewSchema = {
   parse(value) {
-    const ok = value !== null && typeof value === 'object' && typeof value.enabled === 'boolean'
+    const sources = value?.sources
+    const ok = Array.isArray(sources)
+      && sources.every((entry) => entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && typeof entry.enabled === 'boolean')
     if (!ok) throw new TypeError(`claude-memory: invalid mode view ${JSON.stringify(value)}`)
-    return { enabled: value.enabled }
+    return { sources: sources.map(({ id, enabled }) => ({ id, enabled })) }
   },
 }
 
-/** Mode state for a session that has not run `/memory on|off`. */
-export const MODE_UNSET = Object.freeze({ enabled: null })
+/** Mode state for a session that has switched no source. */
+export const MODE_UNSET = Object.freeze({ read: Object.freeze({}) })
 
 /**
  * Pure fold: the newest snapshot of this plugin still on the surface.
@@ -205,18 +230,22 @@ export function applyProjection(state, event) {
 }
 
 /**
- * Pure fold for the per-session switch. The command appends one ignorable
- * `MODE_EVENT_TYPE` record per accepted switch; surface replacements and
- * every other event leave the switch alone, so compaction cannot reset it.
- * @param {{ enabled: boolean | null }} state - prior state.
+ * Pure fold for the per-session read switches. The command appends one
+ * ignorable `MODE_EVENT_TYPE` record `{ source, enabled }` per accepted
+ * switch; surface replacements and every other event leave the switches
+ * alone, so compaction cannot reset them. A record without `source` was
+ * written by 0.3.0 or 0.4.0, when the Claude Code index was the only source,
+ * and is read as a switch of `claude`.
+ * @param {{ read: Record<string, boolean> }} state - prior state.
  * @param {object} event - committed session event.
- * @returns {{ enabled: boolean | null }} next state (same reference when unchanged).
+ * @returns {{ read: Record<string, boolean> }} next state (same reference when unchanged).
  */
 export function applyModeProjection(state, event) {
   if (event.type !== MODE_EVENT_TYPE) return state
   const enabled = event.data?.enabled
-  if (typeof enabled !== 'boolean' || enabled === state.enabled) return state
-  return { enabled }
+  const source = event.data?.source ?? 'claude'
+  if (typeof enabled !== 'boolean' || typeof source !== 'string' || state.read[source] === enabled) return state
+  return { read: { ...state.read, [source]: enabled } }
 }
 
 /**
@@ -241,17 +270,28 @@ export function apply(ctx, config) {
     apply: applyProjection,
   })
 
-  /** The switch position a session is in: its own choice, else the configured default. */
-  const isEnabled = (mode) => mode.enabled ?? config.enabledByDefault
+  /**
+   * The read switches a session is on: its own choice per source, else the
+   * configured default.
+   * @returns {Record<string, boolean>} one entry per {@link SOURCES} id.
+   */
+  const resolveRead = (mode) => Object.fromEntries(SOURCES.map((id) => [id, mode.read[id] ?? config.readByDefault[id]]))
+  const sameRead = (a, b) => SOURCES.every((id) => a[id] === b[id])
 
   ctx.sessionProjections.register({
     key: MODE_PROJECTION_KEY,
-    stateVersion: 2,
+    stateVersion: 3,
     stateSchema: modeStateSchema,
     init: () => MODE_UNSET,
     apply: applyModeProjection,
-    // Client view: the composer pill reads the resolved switch without knowing the default.
-    wire: { viewSchema: modeViewSchema, view: (state) => ({ enabled: isEnabled(state) }) },
+    // Client view: the composer menu lists every source with its resolved switch without knowing the defaults.
+    wire: {
+      viewSchema: modeViewSchema,
+      view: (state) => {
+        const read = resolveRead(state)
+        return { sources: SOURCES.map((id) => ({ id, enabled: read[id] })) }
+      },
+    },
   })
 
   // Optional: only a composed command surface can offer the switch. Injection
@@ -267,24 +307,27 @@ export function apply(ctx, config) {
       commandCtx.commands.register({
         definitionId: COMMAND_DEFINITION_ID,
         name: COMMAND_NAME,
-        description: 'Turn project memory on or off for this session',
-        input: { hint: 'on|off|status' },
+        description: 'Choose which project memory this session reads',
+        input: { hint: `[${SOURCES.join('|')}] on|off | status` },
         handler: ({ agent, rawInput }) => {
-          const action = parseMemoryCommand(rawInput)
-          if (action === undefined) return { kind: 'error', text: 'usage: /memory on|off|status' }
+          const request = parseMemoryCommand(rawInput)
+          if (request === undefined) return { kind: 'error', text: `usage: /memory [${SOURCES.join('|')}] on|off | status` }
           const mode = ctx.sessionProjections.stateOf(agent.session, MODE_PROJECTION_KEY)
           if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
-          if (action === 'status') return { kind: 'success', text: `Memory is ${isEnabled(mode) ? 'on' : 'off'}` }
-          const enabled = action === 'on'
-          if (isEnabled(mode) === enabled) return { kind: 'success', text: `Memory is already ${action}` }
+          const read = resolveRead(mode)
+          const describe = (ids) => ids.map((id) => `${id} ${read[id] ? 'on' : 'off'}`).join(', ')
+          if (request.action === 'status') return { kind: 'success', text: `Memory read: ${describe(SOURCES)}` }
+          const position = request.enabled ? 'on' : 'off'
+          const changing = request.sources.filter((id) => read[id] !== request.enabled)
+          if (changing.length === 0) return { kind: 'success', text: `Memory read already ${position}: ${describe(request.sources)}` }
           let seq
           try {
-            seq = appendPluginRecord(agent.session, MODE_EVENT_TYPE, { enabled })
+            for (const source of changing) seq = appendPluginRecord(agent.session, MODE_EVENT_TYPE, { source, enabled: request.enabled })
           } catch (error) {
             ctx.logger.warn(`claude-memory: cannot store the memory switch for session ${agent.session.id}: ${error.message}`)
             return { kind: 'error', text: 'could not change the memory switch; the session log rejected the update' }
           }
-          return { kind: 'success', text: `Memory ${action}`, sourceEventSeq: seq }
+          return { kind: 'success', text: `Memory read ${position}: ${changing.join(', ')}`, sourceEventSeq: seq }
         },
       })
     } catch (error) {
@@ -329,17 +372,21 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Locate both stores for a working directory and read their indexes. A
-   * store whose index cannot be inspected or read yields `undefined` for the
-   * whole result, so the turn enters nothing rather than a message missing a
-   * section it could not vouch for.
-   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean } } | undefined>}
+   * Locate the stores this session reads and read their indexes. The Claude
+   * Code index is located only when its switch is on. The own store, when
+   * configured, is always named so the model can write to it; its index is
+   * read only when the `dsh` switch is on, else the section says the index is
+   * not loaded. A store whose index cannot be inspected or read yields
+   * `undefined` for the whole result, so the turn enters nothing rather than
+   * a message missing a section it could not vouch for.
+   * @param {Record<string, boolean>} read - resolved switches.
+   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean } } | undefined>}
    */
-  const currentStores = async (session, cwd, signal) => {
+  const currentStores = async (session, cwd, signal, read) => {
     let located
     let own
     try {
-      located = await locateMemoryIndex(cwd, claudeHome)
+      located = read.claude ? await locateMemoryIndex(cwd, claudeHome) : undefined
       own = config.ownMemory ? await locateOwnIndex(cwd, ownMemoryHome) : undefined
     } catch (error) {
       // The file may exist but cannot be inspected right now; say nothing rather than withdraw.
@@ -354,11 +401,11 @@ export function apply(ctx, config) {
       if (index.kind === 'text') stores.claude = { path: located.path, text: index.text, truncated: index.truncated }
     }
     if (own !== undefined) {
-      stores.own = { path: own.path, truncated: false }
-      if (own.size !== undefined) {
+      stores.own = { path: own.path, truncated: false, loaded: read.dsh }
+      if (read.dsh && own.size !== undefined) {
         const index = await currentIndex(session, own)
         if (index.kind === 'error') return undefined
-        if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated }
+        if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true }
       }
     }
     signal.throwIfAborted()
@@ -373,13 +420,15 @@ export function apply(ctx, config) {
     const session = agent.session
     const mode = ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY)
     if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
-    if (!isEnabled(mode)) return decision
+    const read = resolveRead(mode)
+    // Nothing to read and nowhere to write: the turn touches no file.
+    if (!read.claude && !config.ownMemory) return decision
     if (session.header.origin === 'subagent' && !config.includeSubagents) return decision
     const cwd = session.header.cwd
     if (cwd === undefined) return decision
     const state = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
     if (state === undefined) throw new Error('claude-memory requires its session projection to be registered')
-    const stores = await currentStores(session, cwd, signal)
+    const stores = await currentStores(session, cwd, signal, read)
     if (stores === undefined) return decision
     let message
     if (stores.claude === undefined && stores.own === undefined) {
@@ -391,11 +440,11 @@ export function apply(ctx, config) {
     }
     if (state.digest === message.source.digest) return decision
     if (decision.messages.some((entry) => entry.source?.kind === SOURCE_KIND && entry.source.digest === message.source.digest)) return decision
-    // A switch can land while the index is being located and read; re-read it
-    // so a turn that has since been switched off enters nothing.
+    // A switch can land while the indexes are being located and read; re-read
+    // them so a turn whose sources changed meanwhile enters nothing stale.
     const latestMode = ctx.sessionProjections.stateOf(session, MODE_PROJECTION_KEY)
     if (latestMode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
-    if (!isEnabled(latestMode)) return decision
+    if (!sameRead(read, resolveRead(latestMode))) return decision
     ctx.logger.info(`claude-memory: entered ${message.source.path} (${Buffer.byteLength(message.content[0].text, 'utf8')} bytes) into session ${session.id}`)
     // Right after the claimed batch: the user's prompt precedes the index and
     // driver-appended runtime context follows it. When an earlier listener

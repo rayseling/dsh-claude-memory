@@ -12,11 +12,11 @@ dsh 有一个自己的记忆目录,格式与 Claude Code 完全一致,由模型�
 
 - **位置**:`<ownMemoryHome>/<slug>/`,默认 `~/.dsh/memory/<slug>/`,索引是 `MEMORY.md`,条目一文件一事实,frontmatter 为 `name` / `description` / `metadata.type`(`user | feedback | project | reference`),正文带 `**Why:**` / `**How to apply:**` 和 `[[name]]` 互链。`slug` 用与 Claude Code 相同的 `slugOf`。
 - **只有一个目录**:slug 取自 `canonicalRoot(cwd)`——linked worktree 的主仓库,否则 git 根,否则工作目录本身,全部按真实路径。它与 [Claude Code 索引的多候选定位](2026-10-12-memory-directory-location.md) 不同:读 Claude Code 的索引可以试多个候选,写自己的记忆必须收敛到一处,否则两个 worktree 会各写一份。
-- **一条消息、两个段落**:Claude Code 索引段(只读,规则不变)在前,自己的段在后;digest 覆盖整条消息,[snapshot 替代语义](2026-10-12-snapshot-replacement-and-withdrawal.md) 不变。开着 own store 时自己的段始终存在,没有条目也要告诉模型目录在哪、怎么写,因此纯撤回消息只在 `ownMemory: false` 时才会出现;Claude Code 索引消失只是下一条消息少一段,"完整替代此前索引"的声明已经覆盖这种情况。
+- **一条消息、两个段落**:Claude Code 索引段(只读,规则不变)在前,自己的段在后;digest 覆盖整条消息,[snapshot 替代语义](2026-10-12-snapshot-replacement-and-withdrawal.md) 不变。配了 own store 时自己的段始终存在,没有条目也要告诉模型目录在哪、怎么写,因此纯撤回消息只在 `ownMemory: false` 时才会出现;Claude Code 索引消失或被关掉只是下一条消息少一段,"完整替代此前索引"的声明已经覆盖这种情况。
 - **写入规则随消息注入**(`renderMemoryMessage`):记什么、不记什么、写前先查两个索引去重、文件格式、写完给索引加一行、索引只放指针。规则按 Claude Code 系统提示里的记忆规则改写,放在动作之前。
 - **写了就会回灌**:模型写完文件和索引行,下一轮第一步 size/mtime 变了就重读、重注入,不需要新接口。
-- **配置**:`ownMemory`(默认 `true`)和 `ownMemoryHome`(默认 `~/.dsh/memory`,支持 `~/`)。它们没有 Claude Code 对应项,是继 `enabledByDefault` 之后第二组不取 Claude Code 默认值的字段。
-- **开关与文案**:`/memory` 和 composer pill 同时管两个存储,用户可见文案从 "Claude Code memory / Claude Code 记忆" 改为 "Memory / 记忆"。
+- **配置**:`ownMemory`(默认 `true`)和 `ownMemoryHome`(默认 `~/.dsh/memory`,支持 `~/`)。它们没有 Claude Code 对应项,和 `readByDefault` 一样不取 Claude Code 默认值。
+- **写不是会话级开关**:`ownMemory: true` 时自己的段始终注入;会话里只能按来源决定读不读([按来源的读取开关](2026-10-26-session-memory-toggle.md)),`dsh` 读关着时该段只给目录和规则,并要求写前先读索引去重。
 - `~/.claude` 仍然永远只读,注入文本继续要求模型不创建、修改、删除那里的文件。
 
 ## Alternatives considered

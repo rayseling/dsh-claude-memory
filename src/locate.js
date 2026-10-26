@@ -303,8 +303,9 @@ export async function readIndex(path, limits) {
  * Code index is read-only to the model; the harness's own store is the one
  * it maintains, so that section is rendered before its first entry and
  * carries the writing rules.
- * @param {{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean } }} stores -
- *   the located and bounded indexes; `own.text` is undefined while the store has no entries.
+ * @param {{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded?: boolean } }} stores -
+ *   the located and bounded indexes; `own.text` is undefined while the store has no entries, and
+ *   `own.loaded: false` says the session does not read that index, so the model is told to read it before writing.
  * @returns {string} the complete `<system-reminder>` block.
  */
 export function renderMemoryMessage({ claude, own }) {
@@ -323,7 +324,9 @@ export function renderMemoryMessage({ claude, own }) {
   }
   if (own !== undefined) {
     const dir = dirname(own.path)
-    if (own.text === undefined) {
+    if (own.loaded === false) {
+      parts.push('', `Your own memory for this project lives in ${dir}. Its index ${own.path} is not loaded in this session; read it before saving so you do not duplicate an entry.`)
+    } else if (own.text === undefined) {
       parts.push('', `Your own memory for this project lives in ${dir}. It has no entries yet; the directory may not exist.`)
     } else {
       parts.push('', `Contents of ${own.path} (your own memory index for this project; its files live in ${dir}).${rest(own.truncated)}`, '', own.text.trimEnd())
