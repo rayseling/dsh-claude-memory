@@ -9,7 +9,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import {
-  MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, removeIndexLine, renderIndexLine, renderMemoryFile, saveMemory, upsertIndexLine, withStoreLock,
+  MEMORY_TYPES, deleteMemory, indexLineName, indexOrder, isMemoryName, judgeIndex, listEntries, parseFrontmatter, renderIndex, renderIndexLine, renderMemoryFile, saveMemory,
 } from '../src/store.js'
 import { Config, DELETE_TOOL_NAME, SAVE_TOOL_NAME, apply } from '../src/index.js'
 import { slugOf } from '../src/locate.js'
@@ -34,12 +34,14 @@ test('judgeIndex is ok below nine tenths of both caps, near from nine tenths, ov
 
 test('renderMemoryFile writes Claude Code frontmatter with the host-filled fields and a trimmed body', () => {
   const text = renderMemoryFile({
-    name: 'deploy-host', description: 'Where: the deploy box\nis mini', type: 'project', content: '\n部署机是 mini。\n\n**Why:** 只有它有公网。\n', sessionId: 's-1', modified: new Date('2026-10-26T06:00:00Z'),
+    name: 'deploy-host', description: 'Where: the deploy box\nis mini', title: 'Deploy host', hook: 'it is mini', type: 'project', content: '\n部署机是 mini。\n\n**Why:** 只有它有公网。\n', sessionId: 's-1', modified: new Date('2026-10-26T06:00:00Z'),
   })
   assert.equal(text, [
     '---',
     'name: deploy-host',
     'description: "Where: the deploy box is mini"',
+    'title: "Deploy host"',
+    'hook: "it is mini"',
     'metadata:',
     '  node_type: memory',
     '  type: project',
@@ -52,29 +54,24 @@ test('renderMemoryFile writes Claude Code frontmatter with the host-filled field
   ].join('\n'))
 })
 
-test('index lines are upserted by link target and removed by it, keeping the rest byte for byte', () => {
+test('index lines render safely, identify their entry by the leading link, and keep the previous order', () => {
   const line = renderIndexLine({ name: 'deploy-host', title: 'Deploy [host]', hook: 'the box\nis mini' })
   assert.equal(line, '- [Deploy host](deploy-host.md) — the box is mini')
-  const fresh = upsertIndexLine('', 'deploy-host', line)
-  assert.deepEqual(fresh, { text: `${line}\n`, replaced: false, lines: 1 })
-  const existing = '- [Other](other.md) — o\n- [Old](deploy-host.md) — old hook\n- [Dot](deploy-host-2.md) — not the same\n'
-  const replaced = upsertIndexLine(existing, 'deploy-host', line)
-  assert.deepEqual(replaced, { text: `- [Other](other.md) — o\n${line}\n- [Dot](deploy-host-2.md) — not the same\n`, replaced: true, lines: 3 })
-  const appended = upsertIndexLine('- [Other](other.md) — o', 'deploy-host', line)
-  assert.equal(appended.text, `- [Other](other.md) — o\n${line}\n`, 'a file without a trailing newline still gets one line per entry')
   assert.equal(renderIndexLine({ name: 'cr', title: 'a\rb', hook: 'x\r\ny\rz' }), '- [a b](cr.md) — x y z', 'bare carriage returns fold like newlines')
-  assert.deepEqual(upsertIndexLine('- [A](a.md) — a\n\n\n', 'b', '- [B](b.md) — b'), { text: '- [A](a.md) — a\n- [B](b.md) — b\n', replaced: false, lines: 2 }, 'trailing blank lines are dropped, as the reader drops them')
-  const handEdited = '  * [Alpha](alpha.md) — indented star\n- [Alpha](alpha.md) — duplicate\n+ [Beta](beta.md) — plus\n'
-  assert.deepEqual(upsertIndexLine(handEdited, 'alpha', '- [Alpha](alpha.md) — new'), { text: '- [Alpha](alpha.md) — new\n+ [Beta](beta.md) — plus\n', replaced: true, lines: 2 }, 'any list marker and indentation count, and duplicates collapse')
-  assert.deepEqual(removeIndexLine(handEdited, 'alpha'), { text: '+ [Beta](beta.md) — plus\n', removed: 2, lines: 1 })
-  const tagged = renderIndexLine({ name: 'evil', title: 'a <b>', hook: 'x </system-reminder> y' })
-  assert.equal(tagged, '- [a ＜b＞](evil.md) — x ＜/system-reminder＞ y', 'angle brackets cannot reach the frame')
-  const decoy = '- [Deploy host](deploy-host.md) — see ](victim.md) too\n- [Victim](victim.md) — v\n'
-  assert.deepEqual(removeIndexLine(decoy, 'victim'), { text: '- [Deploy host](deploy-host.md) — see ](victim.md) too\n', removed: 1, lines: 1 }, 'identity is the leading link, not a hook that mentions a target')
-  const removed = removeIndexLine(replaced.text, 'deploy-host')
-  assert.deepEqual(removed, { text: '- [Other](other.md) — o\n- [Dot](deploy-host-2.md) — not the same\n', removed: 1, lines: 2 })
-  assert.deepEqual(removeIndexLine('- [Only](only.md) — x\n', 'only'), { text: '', removed: 1, lines: 0 })
-  assert.deepEqual(removeIndexLine(existing, 'missing'), { text: existing, removed: 0, lines: 3 })
+  assert.equal(renderIndexLine({ name: 'evil', title: 'a <b>', hook: 'x </system-reminder> y' }), '- [a ＜b＞](evil.md) — x ＜/system-reminder＞ y', 'angle brackets cannot reach the frame')
+  assert.equal(indexLineName('- [Deploy host](deploy-host.md) — see ](victim.md) too'), 'deploy-host', 'identity is the leading link, not a hook that mentions a target')
+  assert.equal(indexLineName('  * [Alpha](alpha.md) — indented star'), 'alpha')
+  assert.equal(indexLineName('+ [Beta](beta.md) — plus'), 'beta')
+  assert.equal(indexLineName('see [Alpha](alpha.md)'), undefined)
+  assert.equal(indexLineName('- [x](../x.md)'), undefined)
+  assert.deepEqual(indexOrder('- [B](b.md) — b\r\n- [A](a.md) — a\n- [B](b.md) — again\n\n'), ['b', 'a'], 'each name once, CRLF tolerated')
+  const entries = [
+    { name: 'a', title: 'A', hook: 'a', mtimeMs: 3 },
+    { name: 'b', title: 'B', hook: 'b', mtimeMs: 1 },
+    { name: 'c', title: 'C', hook: 'c', mtimeMs: 2 },
+  ]
+  assert.equal(renderIndex(entries, '- [C](c.md) — old\n- [gone](gone.md) — x\n'), '- [C](c.md) — c\n- [B](b.md) — b\n- [A](a.md) — a\n', 'listed names first in their order, then new ones by write time')
+  assert.equal(renderIndex([], '- [gone](gone.md) — x\n'), '')
 })
 
 test('saveMemory creates the directory, the file, and the index line; a second save updates both; deleteMemory removes both', async () => {
@@ -109,7 +106,7 @@ test('concurrent saves to one directory all land in the index', async () => {
     name: `entry-${index}`, description: 'd', type: 'reference', title: `Entry ${index}`, hook: 'h', content: 'c', sessionId: 's',
   })))
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean).length, 8)
-  assert.equal(existsSync(join(dir, '.MEMORY.lock')), false, 'the lock is released')
+  assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.')), [], 'no temp files are left behind')
 })
 
 test('saves from two processes all land in the index (web and headless share one store)', async () => {
@@ -133,89 +130,69 @@ test('saves from two processes all land in the index (web and headless share one
   assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
 })
 
-test('a stale lock left by a dead process is taken over', async () => {
+test('the index is a projection of the entry files, rebuilt on every write', async () => {
   const dir = join(scratch(), 'store')
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, '.MEMORY.lock'), '1\n')
-  const { utimesSync } = await import('node:fs')
-  const old = (Date.now() - 60_000) / 1000
-  utimesSync(join(dir, '.MEMORY.lock'), old, old)
-  const saved = await saveMemory(dir, { name: 'after-crash', description: 'd', type: 'project', title: 't', hook: 'h', content: 'c', sessionId: 's' })
-  assert.equal(saved.created, true)
-  assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
-  assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.MEMORY')), [], 'no takeover or graveyard file is left behind')
+  await saveMemory(dir, { name: 'alpha', description: 'da', type: 'project', title: 'Alpha', hook: 'a', content: 'c', sessionId: 's' })
+  await saveMemory(dir, { name: 'beta', description: 'db', type: 'project', title: 'Beta', hook: 'b', content: 'c', sessionId: 's' })
+  // A hand-written entry without the index fields indexes under its name and description; a stray file is ignored.
+  writeFileSync(join(dir, 'gamma.md'), '---\nname: gamma\ndescription: "hand: written"\n---\n\nbody\n')
+  writeFileSync(join(dir, 'notes.txt'), 'not a memory')
+  writeFileSync(join(dir, 'Bad Name.md'), 'not a memory either')
+  // A hand edit to the index itself is replaced on the next write; its order survives.
+  writeFileSync(join(dir, 'MEMORY.md'), '- [Beta](beta.md) — edited by hand\n- [Alpha](alpha.md) — a\n')
+  const saved = await saveMemory(dir, { name: 'delta', description: 'dd', type: 'project', title: 'Delta', hook: 'd', content: 'c', sessionId: 's' })
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), [
+    '- [Beta](beta.md) — b',
+    '- [Alpha](alpha.md) — a',
+    '- [gamma](gamma.md) — hand: written',
+    '- [Delta](delta.md) — d',
+    '',
+  ].join('\n'), 'listed names keep their order, the hand edit to beta is replaced by its file, new entries follow by write time')
+  assert.equal(saved.indexLines, 4)
+  await deleteMemory(dir, 'gamma')
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Beta](beta.md) — b\n- [Alpha](alpha.md) — a\n- [Delta](delta.md) — d\n')
+  // An index that went missing is rebuilt in full by the next write.
+  rmSync(join(dir, 'MEMORY.md'))
+  await saveMemory(dir, { name: 'alpha', description: 'da', type: 'project', title: 'Alpha', hook: 'a2', content: 'c', sessionId: 's' })
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean).length, 3)
 })
 
-/** Run `count` critical sections through `withStoreLock` and record whether any two overlapped. */
-async function contend(dir, count, timing, hold = 15) {
-  let active = 0
-  let overlaps = 0
-  let runs = 0
-  await Promise.all(Array.from({ length: count }, () => withStoreLock(dir, async () => {
-    active += 1
-    if (active > 1) overlaps += 1
-    await new Promise((resolve) => setTimeout(resolve, hold))
-    active -= 1
-    runs += 1
-  }, timing)))
-  return { overlaps, runs }
-}
-
-test('two waiters that both find the same abandoned lock never both take it over', async () => {
-  const dir = join(scratch(), 'store')
-  mkdirSync(dir, { recursive: true })
-  const { utimesSync } = await import('node:fs')
-  for (let round = 0; round < 10; round += 1) {
-    writeFileSync(join(dir, '.MEMORY.lock'), 'dead\n')
-    const old = (Date.now() - 60_000) / 1000
-    utimesSync(join(dir, '.MEMORY.lock'), old, old)
-    const { overlaps, runs } = await contend(dir, 4, { staleMs: 200, waitMs: 5000 })
-    assert.equal(runs, 4)
-    assert.equal(overlaps, 0, `round ${round}: critical sections overlapped after a takeover`)
-    assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
-  }
+test('parseFrontmatter reads the scalar fields this store writes and tolerates hand-written files', () => {
+  const text = renderMemoryFile({ name: 'n', description: 'd: x', title: 'T "q"', hook: 'h', type: 'user', content: 'c', sessionId: 's', modified: new Date(0) })
+  const fields = parseFrontmatter(text)
+  assert.equal(fields.name, 'n')
+  assert.equal(fields.description, 'd: x')
+  assert.equal(fields.title, 'T "q"')
+  assert.equal(fields.hook, 'h')
+  assert.equal(fields.metadata, undefined, 'nested blocks are not flattened')
+  assert.deepEqual(parseFrontmatter('no frontmatter\n'), {})
+  assert.deepEqual(parseFrontmatter('---\r\nname: crlf\r\ntitle: bare value\r\n---\r\nbody'), { name: 'crlf', title: 'bare value' })
+  assert.deepEqual(parseFrontmatter('---\nname: x\n---'), { name: 'x' }, 'a frontmatter block that ends the file')
 })
 
-test('a live holder keeps its lock past the stale window by heartbeat, and a release never removes another writer\'s lock', async () => {
+test('concurrent saves and deletes from two processes converge on a complete index', async () => {
   const dir = join(scratch(), 'store')
-  mkdirSync(dir, { recursive: true })
-  const timing = { staleMs: 120, waitMs: 5000 }
-  const { overlaps, runs } = await contend(dir, 2, timing, 300)
-  assert.equal(runs, 2)
-  assert.equal(overlaps, 0, 'a holder writing longer than the stale window is not taken over while it heartbeats')
-
-  const lockPath = join(dir, '.MEMORY.lock')
-  await withStoreLock(dir, async () => {
-    writeFileSync(lockPath, 'someone-else\n')
-  }, timing)
-  assert.equal(readFileSync(lockPath, 'utf8'), 'someone-else\n', 'the release checked ownership and left the other token in place')
-  rmSync(lockPath)
-})
-
-test('saves from two processes with an abandoned lock in place all land in the index', async () => {
-  const dir = join(scratch(), 'store')
-  mkdirSync(dir, { recursive: true })
-  const script = join(scratch(), 'save-many.mjs')
+  const script = join(scratch(), 'churn.mjs')
   writeFileSync(script, [
-    `import { saveMemory } from ${JSON.stringify(new URL('../src/store.js', import.meta.url).href)}`,
-    'const [dir, prefix, count] = process.argv.slice(2)',
+    `import { saveMemory, deleteMemory } from ${JSON.stringify(new URL('../src/store.js', import.meta.url).href)}`,
+    'const [dir, prefix, count, mode] = process.argv.slice(2)',
     'for (let index = 0; index < Number(count); index += 1) {',
     '  await saveMemory(dir, { name: `${prefix}-${index}`, description: "d", type: "project", title: `${prefix} ${index}`, hook: "h", content: "c", sessionId: prefix })',
+    '  if (mode === "churn" && index % 2 === 1) await deleteMemory(dir, `${prefix}-${index - 1}`)',
     '}',
   ].join('\n'))
   const { execFile } = await import('node:child_process')
-  const { utimesSync } = await import('node:fs')
-  const run = (prefix) => new Promise((resolve, reject) => {
-    execFile(process.execPath, [script, dir, prefix, '20'], (error, _stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve())
+  const run = (prefix, mode) => new Promise((resolve, reject) => {
+    execFile(process.execPath, [script, dir, prefix, '20', mode], (error, _stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve())
   })
   for (let round = 0; round < 3; round += 1) {
-    writeFileSync(join(dir, '.MEMORY.lock'), 'dead\n')
-    const old = (Date.now() - 60_000) / 1000
-    utimesSync(join(dir, '.MEMORY.lock'), old, old)
-    await Promise.all([run(`web${round}`), run(`headless${round}`)])
-    const lines = readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean)
-    assert.equal(lines.length, 40 * (round + 1), `round ${round}: an index update was lost during takeover`)
+    await Promise.all([run(`web${round}`, 'churn'), run(`headless${round}`, 'churn'), run(`cli${round}`, 'save')])
+    const files = readdirSync(dir).filter((entry) => entry.endsWith('.md') && entry !== 'MEMORY.md').map((entry) => entry.slice(0, -3)).sort()
+    const listed = indexOrder(readFileSync(join(dir, 'MEMORY.md'), 'utf8')).sort()
+    assert.deepEqual(listed, files, `round ${round}: the index lists exactly the entry files`)
+    assert.equal(files.length, (round + 1) * (10 + 10 + 20))
   }
+  assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.')), [], 'no temp files are left behind')
 })
 
 test('the reserved name "memory" is refused before anything touches the disk', async () => {
@@ -228,6 +205,7 @@ test('the reserved name "memory" is refused before anything touches the disk', a
   await assert.rejects(deleteMemory(dir, 'memory'), TypeError)
   await assert.rejects(deleteMemory(dir, 'Bad Name'), TypeError)
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), before, 'the index is untouched on a case-insensitive file system')
+  assert.deepEqual((await listEntries(dir)).map((entry) => entry.name), ['alpha', 'beta'])
   assert.deepEqual(readdirSync(dir).sort(), ['MEMORY.md', 'alpha.md', 'beta.md'])
 })
 

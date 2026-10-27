@@ -261,7 +261,7 @@ export function decodeCompletePrefix(buffer) {
 export function truncateIndex(text, { maxLines, maxChars }) {
   // Trailing blank lines are not entries, and the final newline is not counted
   // against the character cap, the same measure the save tool reports.
-  const body = text.replace(/\n+$/, '')
+  const body = text.replace(/(?:\r?\n)+$/, '')
   const lines = body.split('\n')
   if (lines.length <= maxLines && body.length <= maxChars) return { text, truncated: false }
   const kept = lines.length > maxLines ? lines.slice(0, maxLines) : lines

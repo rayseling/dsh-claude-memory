@@ -1,16 +1,25 @@
 /**
  * Pure helpers that write the harness's own memory store: one memory file
- * plus its index line, in the format Claude Code uses for its auto memory.
- * Nothing here touches the harness; `node --test` covers it with temporary
- * directories. The plugin exposes these through the `memory_save` and
- * `memory_delete` tools because the file sandbox denies the model's own file
- * tools outside the workspace, and because a single writer in the server
- * process can keep the index consistent across concurrent sessions.
+ * per fact, in the format Claude Code uses for its auto memory, and the
+ * `MEMORY.md` index as a projection of those files. Nothing here touches the
+ * harness; `node --test` covers it with temporary directories. The plugin
+ * exposes these through the `memory_save` and `memory_delete` tools because
+ * the file sandbox denies the model's own file tools outside the workspace.
+ *
+ * The index is never read-modify-written. A save writes its own entry file
+ * (atomically, by rename), then rebuilds the index from every entry file in
+ * the directory, then lists the directory again and rebuilds once more if it
+ * changed meanwhile. Two writers in different processes can therefore never
+ * lose each other's line: whichever index write lands last was computed from
+ * a listing taken after every entry written before it, and a writer whose
+ * entry appeared later rebuilds again. No lock file is involved, so there is
+ * no ownership to lose on an abandoned lock either. The price is that an
+ * index line edited by hand is replaced by the entry's own `title` and `hook`
+ * on the next write; the entry file is the place to edit.
  * @module dsh-claude-memory/store
  */
 
-import { randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isAbsence } from './locate.js'
 
@@ -53,7 +62,7 @@ function oneLine(text) {
 }
 
 /**
- * A YAML double-quoted scalar, so a description with `:` or `#` stays one value.
+ * A YAML double-quoted scalar, so a value with `:` or `#` stays one value.
  * @param {string} text
  * @returns {string}
  */
@@ -64,15 +73,18 @@ function yamlString(text) {
 /**
  * Render a memory file: Claude Code's frontmatter (`name`, `description`,
  * `metadata.type`, plus the host-filled `node_type`, `originSessionId` and
- * `modified`) followed by the body.
- * @param {{ name: string, description: string, type: string, content: string, sessionId: string, modified: Date }} memory
+ * `modified`), the two index fields `title` and `hook` this store adds so the
+ * index can be rebuilt from the files, and the body.
+ * @param {{ name: string, description: string, title: string, hook: string, type: string, content: string, sessionId: string, modified: Date }} memory
  * @returns {string} the file text, newline-terminated.
  */
-export function renderMemoryFile({ name, description, type, content, sessionId, modified }) {
+export function renderMemoryFile({ name, description, title, hook, type, content, sessionId, modified }) {
   return [
     '---',
     `name: ${name}`,
     `description: ${yamlString(description)}`,
+    `title: ${yamlString(title)}`,
+    `hook: ${yamlString(hook)}`,
     'metadata:',
     '  node_type: memory',
     `  type: ${type}`,
@@ -82,6 +94,35 @@ export function renderMemoryFile({ name, description, type, content, sessionId, 
     '',
     `${content.trim()}\n`,
   ].join('\n')
+}
+
+/**
+ * The top-level scalar fields of a file's leading YAML frontmatter block.
+ * Only the subset this store writes is understood: `key: value` lines, with
+ * a JSON-quoted or bare value; nested blocks are skipped.
+ * @param {string} text - file text.
+ * @returns {Record<string, string>} the fields found, possibly none.
+ */
+export function parseFrontmatter(text) {
+  const fields = {}
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)
+  if (match === null) return fields
+  for (const line of match[1].split(/\r?\n/)) {
+    const pair = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line)
+    if (pair === null) continue
+    const raw = pair[2].trim()
+    if (raw.length === 0) continue
+    let value = raw
+    if (raw.startsWith('"')) {
+      try {
+        value = JSON.parse(raw)
+      } catch {
+        value = raw
+      }
+    }
+    fields[pair[1]] = String(value)
+  }
+  return fields
 }
 
 /**
@@ -105,45 +146,29 @@ export function renderIndexLine({ name, title, hook }) {
 }
 
 /**
- * Whether an index line is the entry for `<name>.md`: a list item (any
- * marker, any indentation) whose leading link, the one part of a line the
- * writer controls, points at it. A later occurrence inside a hook is not an
- * identity.
+ * The memory name an index line is the entry for: a list item (any marker,
+ * any indentation) whose leading link, the one part of a line the writer
+ * controls, points at `<name>.md`. A later link inside a hook is not an identity.
  * @param {string} line
- * @param {string} name
- * @returns {boolean}
+ * @returns {string | undefined}
  */
-function pointsAt(line, name) {
-  return new RegExp(`^\\s*[-*+]\\s+\\[[^\\]]*\\]\\(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.md\\)`).test(line)
+export function indexLineName(line) {
+  const match = /^\s*[-*+]\s+\[[^\]]*\]\(([^)/\\]+)\.md\)/.exec(line)
+  return match === null ? undefined : match[1]
 }
 
 /**
- * Replace the line that points at `name` or append one; the rest of the
- * index is kept byte for byte. Further lines pointing at the same name
- * (hand edits) are dropped, so the index has one line per memory.
- * @param {string} index - current index text ('' when the file is absent).
- * @param {string} name - memory name.
- * @param {string} line - the new line.
- * @returns {{ text: string, replaced: boolean, lines: number }} the new text, whether a line was replaced, and the line count.
+ * The names an index text lists, in order, each once.
+ * @param {string} text
+ * @returns {string[]}
  */
-export function upsertIndexLine(index, name, line) {
-  const lines = index.length === 0 ? [] : index.replace(/(?:\r?\n)+$/, '').split('\n')
-  const at = lines.findIndex((existing) => pointsAt(existing, name))
-  const kept = at === -1 ? [...lines, line] : lines.filter((existing, position) => position === at || !pointsAt(existing, name))
-  if (at !== -1) kept[at] = line
-  return { text: `${kept.join('\n')}\n`, replaced: at !== -1, lines: kept.length }
-}
-
-/**
- * Drop every line that points at `name`.
- * @param {string} index - current index text.
- * @param {string} name - memory name.
- * @returns {{ text: string, removed: number, lines: number }} the new text, how many lines went, and the line count.
- */
-export function removeIndexLine(index, name) {
-  const lines = index.length === 0 ? [] : index.replace(/(?:\r?\n)+$/, '').split('\n')
-  const kept = lines.filter((existing) => !pointsAt(existing, name))
-  return { text: kept.length === 0 ? '' : `${kept.join('\n')}\n`, removed: lines.length - kept.length, lines: kept.length }
+export function indexOrder(text) {
+  const names = []
+  for (const line of text.split(/\r?\n/)) {
+    const name = indexLineName(line)
+    if (name !== undefined && !names.includes(name)) names.push(name)
+  }
+  return names
 }
 
 /**
@@ -161,153 +186,118 @@ async function readOrEmpty(path) {
 
 /**
  * Write a file through a sibling temporary name and a rename, so a reader
- * (another session's first step) never sees a half-written index.
+ * (another session's first step) never sees a half-written file.
  * @param {string} path
  * @param {string} text
  */
 async function writeAtomic(path, text) {
-  const temp = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.tmp`)
-  await writeFile(temp, text, 'utf8')
-  await rename(temp, path)
+  const temp = join(dirname(path), `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`)
+  try {
+    await writeFile(temp, text, 'utf8')
+    await rename(temp, path)
+  } catch (error) {
+    await rm(temp, { force: true })
+    throw error
+  }
 }
 
-/** Pending write per directory, so two sessions of one process update the index in turn. */
+/**
+ * Every memory entry in a directory: each `<name>.md` with a valid name,
+ * read for its index fields. An entry that vanishes between the listing and
+ * the read (a concurrent delete) is skipped. A file without `title` or `hook`
+ * (written by hand, or copied from Claude Code) indexes under its name and
+ * description.
+ * @param {string} dir
+ * @returns {Promise<{ name: string, title: string, hook: string, mtimeMs: number }[]>} sorted by name.
+ */
+export async function listEntries(dir) {
+  let names
+  try {
+    names = await readdir(dir)
+  } catch (error) {
+    if (isAbsence(error)) return []
+    throw error
+  }
+  const entries = []
+  for (const file of names) {
+    if (!file.endsWith('.md')) continue
+    const name = file.slice(0, -3)
+    if (!isMemoryName(name)) continue
+    const path = join(dir, file)
+    let text
+    let info
+    try {
+      info = await stat(path)
+      if (!info.isFile()) continue
+      text = await readFile(path, 'utf8')
+    } catch (error) {
+      if (isAbsence(error)) continue
+      throw error
+    }
+    const fields = parseFrontmatter(text)
+    entries.push({ name, title: fields.title ?? fields.name ?? name, hook: fields.hook ?? fields.description ?? '', mtimeMs: info.mtimeMs })
+  }
+  return entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+}
+
+/**
+ * The index text for a set of entries: names already in the previous index
+ * keep their order, newer entries follow in the order they were written.
+ * @param {{ name: string, title: string, hook: string, mtimeMs: number }[]} entries
+ * @param {string} previous - the previous index text, for ordering only.
+ * @returns {string} the index text, newline-terminated, or '' for no entries.
+ */
+export function renderIndex(entries, previous) {
+  const byName = new Map(entries.map((entry) => [entry.name, entry]))
+  const ordered = []
+  for (const name of indexOrder(previous)) {
+    const entry = byName.get(name)
+    if (entry !== undefined) {
+      ordered.push(entry)
+      byName.delete(name)
+    }
+  }
+  const fresh = [...byName.values()].sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : 1))
+  const lines = [...ordered, ...fresh].map(renderIndexLine)
+  return lines.length === 0 ? '' : `${lines.join('\n')}\n`
+}
+
+/**
+ * @param {{ name: string, mtimeMs: number }[]} entries
+ * @returns {string} a fingerprint of which entries exist and when they were written.
+ */
+const fingerprint = (entries) => entries.map((entry) => `${entry.name}@${entry.mtimeMs}`).join('|')
+
+/** How many times a writer rebuilds the index after seeing the directory change under it. */
+const REBUILD_ROUNDS = 8
+
+/**
+ * Rebuild `<dir>/MEMORY.md` from the entry files until a rebuild sees the
+ * same directory it was built from. The loop ends after a bounded number of
+ * rounds; the last write is still built from a complete listing.
+ * @param {string} dir
+ * @returns {Promise<{ indexPath: string, text: string, indexLines: number, indexChars: number }>}
+ */
+async function rebuildIndex(dir) {
+  const indexPath = join(dir, 'MEMORY.md')
+  let entries = await listEntries(dir)
+  let text = ''
+  for (let round = 0; round < REBUILD_ROUNDS; round += 1) {
+    text = renderIndex(entries, await readOrEmpty(indexPath))
+    await writeAtomic(indexPath, text)
+    const again = await listEntries(dir)
+    if (fingerprint(again) === fingerprint(entries)) break
+    entries = again
+  }
+  const body = text.replace(/(?:\r?\n)+$/, '')
+  return { indexPath, text, indexLines: body.length === 0 ? 0 : body.split('\n').length, indexChars: body.length }
+}
+
+/** Pending write per directory, so two sessions of one process rebuild in turn rather than in parallel. */
 const queues = new Map()
 
-/** Lock timing: a lock whose heartbeat stopped this long ago is presumed abandoned; a writer waits this long before giving up. */
-export const LOCK_TIMING = Object.freeze({ staleMs: 10_000, waitMs: 10_000 })
-
 /**
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-/**
- * Create `path` exclusively with `content`, closing the handle whatever happens.
- * @param {string} path
- * @param {string} content
- * @returns {Promise<boolean>} false when the path already exists.
- */
-async function createExclusive(path, content) {
-  let handle
-  try {
-    handle = await open(path, 'wx')
-  } catch (error) {
-    if (error?.code === 'EEXIST') return false
-    throw error
-  }
-  try {
-    await handle.writeFile(content)
-  } finally {
-    await handle.close()
-  }
-  return true
-}
-
-/**
- * Remove `path` only while it still carries `token`, so a release never
- * removes a lock another writer took over in the meantime.
- * @param {string} path
- * @param {string} token
- */
-async function removeIfOwned(path, token) {
-  let owner
-  try {
-    owner = await readFile(path, 'utf8')
-  } catch (error) {
-    if (isAbsence(error)) return
-    throw error
-  }
-  if (owner === token) await rm(path, { force: true })
-}
-
-/**
- * Take over `lockPath` if it is abandoned. Takeover is serialized through a
- * second exclusive file, `<lock>.takeover`, so two waiters cannot both decide
- * the same lock is stale: under that mutex the lock is inspected again, and
- * only a file that is still the same inode and still past `staleMs` is
- * renamed away and removed. A takeover file itself older than `staleMs` is
- * the trace of a writer that died inside this function and is removed.
- * @param {string} lockPath
- * @param {number} staleMs
- * @returns {Promise<void>} resolves once the stale lock is gone, or at once when it was not stale or someone else is handling it.
- */
-async function takeOverIfStale(lockPath, staleMs) {
-  let before
-  try {
-    before = await stat(lockPath)
-  } catch (error) {
-    if (isAbsence(error)) return
-    throw error
-  }
-  if (Date.now() - before.mtimeMs <= staleMs) return
-  const mutex = `${lockPath}.takeover`
-  if (!await createExclusive(mutex, `${process.pid}\n`)) {
-    const info = await stat(mutex).catch(() => undefined)
-    if (info !== undefined && Date.now() - info.mtimeMs > staleMs) await rm(mutex, { force: true })
-    return
-  }
-  try {
-    let again
-    try {
-      again = await stat(lockPath)
-    } catch (error) {
-      if (isAbsence(error)) return
-      throw error
-    }
-    if (again.ino !== before.ino || Date.now() - again.mtimeMs <= staleMs) return
-    const graveyard = `${lockPath}.stale.${process.pid}.${Date.now()}`
-    try {
-      await rename(lockPath, graveyard)
-    } catch (error) {
-      if (isAbsence(error)) return
-      throw error
-    }
-    await rm(graveyard, { force: true })
-  } finally {
-    await rm(mutex, { force: true })
-  }
-}
-
-/**
- * Hold `<dir>/.MEMORY.lock` while `task` runs, so writers in other processes
- * (a web and a headless session of one project) read and rewrite the index in
- * turn. The lock is an exclusively created file carrying the holder's token;
- * the holder touches it every quarter of `staleMs` while the task runs, so a
- * long write is not mistaken for an abandoned one, and releases it only while
- * it still carries its token. An abandoned lock is taken over through
- * {@link takeOverIfStale}.
- * @template T
- * @param {string} dir - the memory directory, which must exist.
- * @param {() => Promise<T>} task
- * @param {{ staleMs?: number, waitMs?: number }} [timing] - overrides for tests; production uses {@link LOCK_TIMING}.
- * @returns {Promise<T>}
- * @throws {Error} when the lock stays held by a live writer past `waitMs`.
- */
-export async function withStoreLock(dir, task, { staleMs = LOCK_TIMING.staleMs, waitMs = LOCK_TIMING.waitMs } = {}) {
-  const lockPath = join(dir, '.MEMORY.lock')
-  const token = `${process.pid}:${randomUUID()}\n`
-  const deadline = Date.now() + waitMs
-  while (!await createExclusive(lockPath, token)) {
-    await takeOverIfStale(lockPath, staleMs)
-    if (Date.now() > deadline) throw new Error(`memory store ${dir} is locked by another writer (${lockPath}); try again`)
-    await sleep(10 + Math.random() * 20)
-  }
-  const now = () => new Date()
-  const heartbeat = setInterval(() => { utimes(lockPath, now(), now()).catch(() => {}) }, Math.max(1, Math.floor(staleMs / 4)))
-  heartbeat.unref?.()
-  try {
-    return await task()
-  } finally {
-    clearInterval(heartbeat)
-    await removeIfOwned(lockPath, token)
-  }
-}
-
-/**
- * Run `task` after every earlier task on the same directory in this process
- * has settled, under the cross-process lock.
+ * Run `task` after every earlier task on the same directory in this process has settled.
  * @template T
  * @param {string} dir
  * @param {() => Promise<T>} task
@@ -315,19 +305,18 @@ export async function withStoreLock(dir, task, { staleMs = LOCK_TIMING.staleMs, 
  */
 function serialized(dir, task) {
   const previous = queues.get(dir) ?? Promise.resolve()
-  const run = previous.then(() => withStoreLock(dir, task), () => withStoreLock(dir, task))
+  const run = previous.then(task, task)
   queues.set(dir, run.catch(() => {}))
   return run
 }
 
 /**
- * Create or replace one memory and its index line.
+ * Create or replace one memory and rebuild the index.
  * @param {string} dir - the project's own memory directory, created when missing.
  * @param {{ name: string, description: string, type: string, title: string, hook: string, content: string, sessionId: string, modified?: Date }} memory
  * @returns {Promise<{ path: string, indexPath: string, created: boolean, indexLines: number, indexChars: number }>} where the file
- *   went, whether it is new (no index line pointed at it before), and the index's line and UTF-16 code unit counts (without
- *   the final newline, as the reader counts) after the write, which the caller measures against the read caps the way Claude
- *   Code does after every index write.
+ *   went, whether it is new, and the index's line and UTF-16 code unit counts (without the final newline, as the reader
+ *   counts) after the write, which the caller measures against the read caps the way Claude Code does after every index write.
  * @throws {TypeError} for a name that is not a valid, unreserved stem; nothing is written.
  */
 export async function saveMemory(dir, memory) {
@@ -335,11 +324,16 @@ export async function saveMemory(dir, memory) {
   await mkdir(dir, { recursive: true })
   return serialized(dir, async () => {
     const path = join(dir, `${memory.name}.md`)
-    const indexPath = join(dir, 'MEMORY.md')
+    let created = true
+    try {
+      await stat(path)
+      created = false
+    } catch (error) {
+      if (!isAbsence(error)) throw error
+    }
     await writeAtomic(path, renderMemoryFile({ ...memory, modified: memory.modified ?? new Date() }))
-    const index = upsertIndexLine(await readOrEmpty(indexPath), memory.name, renderIndexLine(memory))
-    await writeAtomic(indexPath, index.text)
-    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.replace(/(?:\r?\n)+$/, '').length }
+    const index = await rebuildIndex(dir)
+    return { path, indexPath: index.indexPath, created, indexLines: index.indexLines, indexChars: index.indexChars }
   })
 }
 
@@ -358,7 +352,7 @@ export function judgeIndex({ indexLines, indexChars }, { maxLines, maxChars }) {
 }
 
 /**
- * Remove one memory and its index line. A memory that is already gone is
+ * Remove one memory and rebuild the index. A memory that is already gone is
  * not an error: the end state is what the caller asked for.
  * @param {string} dir - the project's own memory directory.
  * @param {string} name - memory name.
@@ -377,6 +371,7 @@ export async function deleteMemory(dir, name) {
     return { path, indexPath, removedFile: false, removedLines: 0, indexLines: 0 }
   }
   return serialized(dir, async () => {
+    const listed = indexOrder(await readOrEmpty(indexPath)).includes(name)
     let removedFile = true
     try {
       await rm(path)
@@ -384,9 +379,7 @@ export async function deleteMemory(dir, name) {
       if (!isAbsence(error)) throw error
       removedFile = false
     }
-    const current = await readOrEmpty(indexPath)
-    const index = removeIndexLine(current, name)
-    if (index.removed > 0) await writeAtomic(indexPath, index.text)
-    return { path, indexPath, removedFile, removedLines: index.removed, indexLines: index.lines }
+    const index = await rebuildIndex(dir)
+    return { path, indexPath, removedFile, removedLines: listed ? 1 : 0, indexLines: index.indexLines }
   })
 }
