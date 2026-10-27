@@ -335,7 +335,7 @@ export function renderMemoryMessage({ claude, own, maxLines = 200 }) {
   // Index text is user data; a line that spells the closing tag must not end the frame early.
   const framed = (text) => text.trimEnd().replace(/<(\/?)system-reminder/gi, '＜$1system-reminder')
   const rest = (truncated) => truncated
-    ? ' Only the beginning of this index is shown: entries past it may exist, so do not infer deletions from this part; read the file directly for the rest.'
+    ? ' Only part of this index is shown: an entry missing from it may still exist, so do not infer deletions from this part; list its directory to see every entry file.'
     : ' This index is shown in full: an entry missing from it no longer exists.'
   const parts = [
     '<system-reminder>',

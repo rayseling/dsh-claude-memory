@@ -62,7 +62,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { locateMemoryIndex, locateOwnIndex, ownMemoryDir, readIndex, renderMemoryMessage, renderWithdrawnMessage, truncateIndex } from './locate.js'
-import { MEMORY_TYPES, deleteMemory, isEntryName, isMemoryName, judgeIndex, projectIndex, saveMemory, syncIndex } from './store.js'
+import { MEMORY_TYPES, deleteMemory, isEntryName, isMemoryName, judgeIndex, saveMemory, syncIndex } from './store.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'claude-memory'
@@ -386,8 +386,8 @@ export function apply(ctx, config) {
               properties: {
                 path: { type: 'string', required: true },
                 created: { type: 'boolean', required: true },
-                indexLines: { type: 'integer', required: true },
-                indexChars: { type: 'integer', required: true },
+                indexLines: { type: 'integer' },
+                indexChars: { type: 'integer' },
                 indexNote: { type: 'string', required: true },
               },
             },
@@ -401,7 +401,15 @@ export function apply(ctx, config) {
             }
             const dir = await dirOf(exec)
             const saved = await saveMemory(dir, { ...args, sessionId: String(exec.agent.session.id) })
-            return { path: saved.path, created: saved.created, indexLines: saved.indexLines, indexChars: saved.indexChars, indexNote: indexVerdict(saved) }
+            // The entry is committed before the cache is touched; a cache failure is reported beside the save, never as its failure.
+            const cacheNote = saved.indexError === undefined ? '' : ` The index cache ${saved.indexPath} could not be rewritten (${saved.indexError.message}); the memory is saved and the index is projected from the entry files on the next read.`
+            const verdict = saved.indexLines === undefined ? '' : indexVerdict(saved)
+            return {
+              path: saved.path,
+              created: saved.created,
+              ...(saved.indexLines === undefined ? {} : { indexLines: saved.indexLines, indexChars: saved.indexChars }),
+              indexNote: `${cacheNote}${verdict}`,
+            }
           },
         })))
         disposers.push(toolCtx.tools.register(defineTool({
@@ -417,17 +425,23 @@ export function apply(ctx, config) {
               properties: {
                 path: { type: 'string', required: true },
                 existed: { type: 'boolean', required: true },
-                indexLines: { type: 'integer', required: true },
+                indexLines: { type: 'integer' },
+                indexNote: { type: 'string', required: true },
               },
             },
-            render: (args, value) => [{ type: 'text', text: value.existed ? `Deleted memory ${args.name}.` : `No memory named ${args.name} in ${value.path.slice(0, value.path.lastIndexOf('/'))}; nothing to delete.` }],
+            render: (args, value) => [{ type: 'text', text: `${value.existed ? `Deleted memory ${args.name}.` : `No memory named ${args.name} in ${value.path.slice(0, value.path.lastIndexOf('/'))}; nothing to delete.`}${value.indexNote}` }],
           },
           isConcurrencySafe: () => false,
           async execute(args, exec) {
             if (!isEntryName(args.name)) throw new Error(`name must be a file stem as the index links it (letters, digits, dots, hyphens, underscores; no leading dot) and not the reserved "memory", got ${JSON.stringify(args.name)}`)
             const dir = await dirOf(exec)
             const removed = await deleteMemory(dir, args.name)
-            return { path: removed.path, existed: removed.removedFile || removed.removedLines > 0, indexLines: removed.indexLines }
+            return {
+              path: removed.path,
+              existed: removed.removedFile,
+              ...(removed.indexLines === undefined ? {} : { indexLines: removed.indexLines }),
+              indexNote: removed.indexError === undefined ? '' : ` The index cache ${removed.indexPath} could not be rewritten (${removed.indexError.message}); the index is projected from the entry files on the next read.`,
+            }
           },
         })))
         toolsRegistered = true
@@ -522,13 +536,15 @@ export function apply(ctx, config) {
 
   /**
    * The own index as projected from its entry files, bounded like a read
-   * index, with the file on disk repaired when it disagrees. The projection
-   * is what the model sees, so an index file left behind by an interrupted
-   * or overlapping write cannot hide an entry. A repair that fails is warned
-   * about once and changes nothing shown; an entry that cannot be read is
-   * warned about once and marks the index truncated, since it is missing a
-   * line. A projection that fails altogether (the directory or index file is
-   * unreadable) is `undefined`, and the section degrades to "not loaded".
+   * index, with the cache file repaired when it disagrees. The projection is
+   * what the model sees, so a cache left behind by an interrupted or
+   * overlapping write cannot hide an entry, and a cache that cannot be used
+   * (unreadable, a directory, a FIFO, a symbolic link) or rewritten changes
+   * nothing shown: each is warned about once. A `.md` file that is not a
+   * readable entry is warned about once per set of names; when the cache had
+   * no line to keep for it, the index is marked partial, since the model
+   * cannot see it. Only a directory that cannot be listed leaves the
+   * projection `undefined`, and the section degrades to "not loaded".
    * @param {string} indexPath - the own `MEMORY.md` path.
    * @returns {Promise<{ text: string, truncated: boolean } | undefined>}
    */
@@ -536,23 +552,19 @@ export function apply(ctx, config) {
     const dir = dirname(indexPath)
     let index
     try {
-      index = await projectIndex(dir)
-      if (index.stale) {
-        try {
-          await syncIndex(dir)
-        } catch (error) {
-          warnOnce(session, `${indexPath}#repair`, `claude-memory: cannot rewrite ${indexPath} from its entry files: ${error.message}; the projected index is shown anyway`)
-        }
-      }
+      index = await syncIndex(dir)
     } catch (error) {
-      warnOnce(session, indexPath, `claude-memory: cannot read ${indexPath}: ${error.message}`)
+      warnOnce(session, indexPath, `claude-memory: cannot list ${dir}: ${error.message}`)
       return undefined
     }
+    if (index.cacheError !== undefined) warnOnce(session, `${indexPath}#cache`, `claude-memory: the index cache ${indexPath} cannot be used: ${index.cacheError.message}; the index is projected from the entry files alone`)
+    if (index.repairError !== undefined) warnOnce(session, `${indexPath}#repair`, `claude-memory: cannot rewrite the index cache ${indexPath}: ${index.repairError.message}; the projected index is shown anyway`)
     if (index.skipped.length > 0) {
-      warnOnce(session, `${indexPath}#skipped`, `claude-memory: ${index.skipped.length} entry file(s) in ${dir} cannot be read (${index.skipped.map((entry) => `${entry.name}.md: ${entry.error.message}`).join('; ')}); the index shown omits them`)
+      const why = (entry) => (entry.reason === 'name' ? 'not an entry name' : entry.error.message)
+      warnOnce(session, `${indexPath}#skipped:${index.skipped.map((entry) => entry.name).join('|')}`, `claude-memory: ${index.skipped.length} file(s) in ${dir} are not readable entries (${index.skipped.map((entry) => `${entry.name}.md: ${why(entry)}`).join('; ')}); the index keeps their previous lines, if any`)
     }
-    const bounded = truncateIndex(index.text, limits)
-    return { text: bounded.text, truncated: bounded.truncated || index.skipped.length > 0 }
+    const cut = truncateIndex(index.text, limits)
+    return { text: cut.text, truncated: cut.truncated || index.omitted.length > 0 }
   }
 
   /**
@@ -588,18 +600,19 @@ export function apply(ctx, config) {
     if (ownMemory) {
       let own
       try {
-        own = await locateOwnIndex(cwd, ownMemoryHome, { stat: read.dsh })
+        own = await locateOwnIndex(cwd, ownMemoryHome, { stat: false })
       } catch (error) {
-        // Without a canonical root or a stat there is no directory to vouch for; leave the section out this turn.
-        warnOnce(session, `${cwd}#own`, `claude-memory: cannot inspect the own memory index for ${cwd}: ${error.message}`)
+        // Without a canonical root there is no directory to name; leave the section out this turn.
+        warnOnce(session, `${cwd}#own`, `claude-memory: cannot locate the own memory store for ${cwd}: ${error.message}`)
         stores.incomplete = true
       }
       if (own !== undefined) {
         if (!toolsRegistered) warnOnce(session, 'tools', `claude-memory: the host registered no memory tools; session ${session.id} is told its own store cannot be written`)
         const unwritable = !toolsRegistered ? 'no-tools' : readOnly(session) ? 'read-only' : undefined
         stores.own = { path: own.path, truncated: false, loaded: read.dsh, ...(unwritable === undefined ? {} : { unwritable }) }
+        // Projected even when the switch is off, so the cache the model is told to `cat` before saving is current.
+        const index = await currentOwnIndex(session, own.path)
         if (read.dsh) {
-          const index = await currentOwnIndex(session, own.path)
           if (index === undefined) stores.own.loaded = false
           else if (index.text.trim().length > 0 || index.truncated) stores.own = { ...stores.own, text: index.text, truncated: index.truncated, loaded: true }
         }

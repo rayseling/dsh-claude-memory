@@ -93,11 +93,11 @@ test('saveMemory creates the directory, the file, and the index line; a second s
   await saveMemory(dir, { name: 'other', description: 'o', type: 'user', title: 'Other', hook: 'o', content: 'o', sessionId: 's-1' })
   assert.deepEqual(readdirSync(dir).sort(), ['MEMORY.md', 'deploy-host.md', 'other.md'], 'no temp file is left behind')
   const removed = await deleteMemory(dir, 'deploy-host')
-  assert.deepEqual(removed, { path: first.path, indexPath: join(dir, 'MEMORY.md'), removedFile: true, removedLines: 1, indexLines: 1 })
+  assert.deepEqual(removed, { path: first.path, indexPath: join(dir, 'MEMORY.md'), removedFile: true, indexLines: 1 })
   assert.equal(existsSync(first.path), false)
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Other](other.md) — o\n')
   const again = await deleteMemory(dir, 'deploy-host')
-  assert.deepEqual(again, { path: first.path, indexPath: join(dir, 'MEMORY.md'), removedFile: false, removedLines: 0, indexLines: 1 }, 'deleting a missing memory is not an error')
+  assert.deepEqual(again, { path: first.path, indexPath: join(dir, 'MEMORY.md'), removedFile: false, indexLines: 1 }, 'deleting a missing memory is not an error')
   const nowhere = join(scratch(), 'never-created')
   assert.equal((await deleteMemory(nowhere, 'x')).removedFile, false)
   assert.equal(existsSync(nowhere), false, 'a delete does not create a store')
@@ -188,19 +188,21 @@ test('an entry that cannot be read is reported and skipped, and neither blocks t
   try {
     const listed = await listEntries(dir)
     assert.deepEqual(listed.entries.map((entry) => entry.name), ['readable'], 'symbolic links are not followed')
-    assert.deepEqual(listed.skipped.map((entry) => entry.name), ['locked'])
-    assert.match(listed.skipped[0].error.message, /EACCES/)
+    assert.deepEqual(listed.skipped.map((entry) => [entry.name, entry.reason, entry.error.code]), [['linked', 'unreadable', 'ENOTREG'], ['locked', 'unreadable', 'EACCES']])
     const index = await projectIndex(dir)
-    assert.deepEqual(index.skipped.map((entry) => entry.name), ['locked'])
-    assert.equal(index.text, '- [readable](readable.md) — h\n')
+    assert.equal(index.text, '- [readable](readable.md) — h\n- [locked](locked.md) — h\n', 'the unreadable entry keeps the line the cache had for it')
+    assert.deepEqual(index.omitted.map((entry) => entry.name), ['linked'], 'only a skipped file without a cached line is missing from the projection')
     const saved = await saveMemory(dir, { name: 'more', description: 'd', type: 'project', title: 'More', hook: 'h', content: 'c', sessionId: 's' })
-    assert.equal(saved.indexLines, 2)
+    assert.equal(saved.indexLines, 3)
+    assert.equal(saved.indexError, undefined)
     await deleteMemory(dir, 'readable')
-    assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [More](more.md) — h\n')
+    assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [locked](locked.md) — h\n- [More](more.md) — h\n')
   } finally {
     chmodSync(join(dir, 'locked.md'), 0o644)
   }
-  assert.equal((await projectIndex(dir)).text, '- [More](more.md) — h\n- [locked](locked.md) — h\n', 'readable again, the entry is back')
+  const back = await projectIndex(dir)
+  assert.equal(back.text, '- [locked](locked.md) — h\n- [More](more.md) — h\n', 'readable again, the entry renders from its file in its old place')
+  assert.deepEqual(back.skipped.map((entry) => entry.name), ['linked'])
 })
 
 test('the index is a projection of the entry files, rebuilt on every write', async () => {
@@ -212,8 +214,8 @@ test('the index is a projection of the entry files, rebuilt on every write', asy
   writeFileSync(join(dir, 'notes.txt'), 'not a memory')
   writeFileSync(join(dir, 'Bad Name.md'), 'not a memory either')
   writeFileSync(join(dir, '.hidden.md'), 'nor this')
-  // A hand edit to the index itself is replaced on the next write; its order survives.
-  writeFileSync(join(dir, 'MEMORY.md'), '- [Beta](beta.md) — edited by hand\n- [Alpha](alpha.md) — a\n')
+  // A hand edit to the index itself is replaced on the next write; its order survives, CRLF or not.
+  writeFileSync(join(dir, 'MEMORY.md'), '- [Beta](beta.md) — edited by hand\r\n- [Alpha](alpha.md) — a\r\n')
   const saved = await saveMemory(dir, { name: 'delta', description: 'dd', type: 'project', title: 'Delta', hook: 'd', content: 'c', sessionId: 's' })
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), [
     '- [Beta](beta.md) — b',
@@ -245,6 +247,11 @@ test('parseFrontmatter reads the scalar fields this store writes and tolerates h
   assert.deepEqual(parseFrontmatter('﻿---\nname: bom\n---\n'), { name: 'bom' }, 'a byte order mark is ignored')
   assert.deepEqual(parseFrontmatter("---\ntitle: 'it''s quoted'\nhook: bare # a comment\nempty:\n---\n"), { title: "it's quoted", hook: 'bare' })
   assert.deepEqual(
+    parseFrontmatter('---\ntitle: "a # not a comment" # a comment\nhook: \'b\' # c\ndescription: "" # empty\nname: null\nextra: ~\nlist: []\nmap: {}\nkeep: "x\\"y"\n---\n'),
+    { title: 'a # not a comment', hook: 'b', keep: 'x"y' },
+    'a comment after a quoted scalar is dropped; empty and null values are absent',
+  )
+  assert.deepEqual(
     parseFrontmatter('---\ndescription: |-\n  first line\n\n  third: line\nhook: >\n  folded\n  text\ntitle: after\n---\n'),
     { description: 'first line\n\nthird: line', hook: 'folded text', title: 'after' },
     'block scalars take their indented lines',
@@ -275,6 +282,75 @@ test('concurrent saves and deletes from two processes converge on a complete ind
     assert.equal(files.length, (round + 1) * (10 + 10 + 20))
   }
   assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.')), [], 'no temp files are left behind')
+})
+
+/**
+ * The state table the three store contracts are judged by: every cache state
+ * crossed with every entry state, asserting only that readable entries are
+ * shown, that a save and a delete commit, and that nothing hangs. Each cell
+ * builds a fresh directory.
+ */
+test('state table: whatever the cache is, readable entries are shown and writes commit without hanging', async (t) => {
+  const { chmodSync, mkdirSync: mkdir, symlinkSync } = await import('node:fs')
+  const { execFile } = await import('node:child_process')
+  const root = typeof process.getuid === 'function' && process.getuid() === 0
+  const mkfifo = (path) => new Promise((resolve) => execFile('mkfifo', [path], (error) => resolve(error === null)))
+  const caches = {
+    ok: async (dir) => { await syncIndex(dir) },
+    missing: async (dir) => { rmSync(join(dir, 'MEMORY.md'), { force: true }) },
+    stale: async (dir) => { writeFileSync(join(dir, 'MEMORY.md'), '# Title\n- [Ghost](ghost.md) — no such file\n') },
+    unreadable: async (dir) => { writeFileSync(join(dir, 'MEMORY.md'), '- [x](x.md) — x\n'); chmodSync(join(dir, 'MEMORY.md'), 0o000) },
+    directory: async (dir) => { rmSync(join(dir, 'MEMORY.md'), { force: true }); mkdir(join(dir, 'MEMORY.md')) },
+    fifo: async (dir) => { rmSync(join(dir, 'MEMORY.md'), { force: true }); return mkfifo(join(dir, 'MEMORY.md')) },
+    'symlink-loop': async (dir) => { rmSync(join(dir, 'MEMORY.md'), { force: true }); symlinkSync(join(dir, 'MEMORY.md'), join(dir, 'MEMORY.md')) },
+  }
+  const entries = {
+    ok: async (dir) => { await saveMemory(dir, { name: 'fact', description: 'd', type: 'project', title: 'Fact', hook: 'the fact', content: 'c', sessionId: 's' }); return '- [Fact](fact.md) — the fact' },
+    skipped: async (dir) => {
+      await saveMemory(dir, { name: 'fact', description: 'd', type: 'project', title: 'Fact', hook: 'the fact', content: 'c', sessionId: 's' })
+      await saveMemory(dir, { name: 'locked', description: 'd', type: 'project', title: 'Locked', hook: 'kept from the cache', content: 'c', sessionId: 's' })
+      chmodSync(join(dir, 'locked.md'), 0o000)
+      return '- [Fact](fact.md) — the fact'
+    },
+    legacy: async (dir) => { writeFileSync(join(dir, 'fact.md'), '---\nname: fact\ndescription: legacy description\n---\n\nbody\n'); return '- [fact](fact.md) — legacy description' },
+    'space-name': async (dir) => {
+      await saveMemory(dir, { name: 'fact', description: 'd', type: 'project', title: 'Fact', hook: 'the fact', content: 'c', sessionId: 's' })
+      writeFileSync(join(dir, 'My Note.md'), '---\nname: My Note\ndescription: outside the grammar\n---\n\nbody\n')
+      return '- [Fact](fact.md) — the fact'
+    },
+  }
+  for (const [cacheState, makeCache] of Object.entries(caches)) {
+    for (const [entryState, makeEntries] of Object.entries(entries)) {
+      const cell = `${cacheState} × ${entryState}`
+      if (root && (cacheState === 'unreadable' || entryState === 'skipped')) continue
+      const dir = join(scratch(), 'store')
+      mkdir(dir, { recursive: true })
+      const expectedLine = await makeEntries(dir)
+      const cachedLine = cacheState === 'ok' && entryState === 'skipped' ? '- [Locked](locked.md) — kept from the cache' : undefined
+      const made = await makeCache(dir)
+      if (made === false) continue
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(`${cell}: hung`)), 5000).unref())
+      try {
+        const shown = await Promise.race([projectIndex(dir), timeout])
+        assert.ok(shown.text.includes(`${expectedLine}\n`), `${cell}: the readable entry is shown\n${shown.text}`)
+        if (cachedLine !== undefined) assert.ok(shown.text.includes(cachedLine), `${cell}: the unreadable entry keeps its cached line`)
+        assert.ok(!shown.text.includes('Ghost') && !shown.text.includes('# Title'), `${cell}: stale lines are gone`)
+        if (entryState === 'space-name') assert.deepEqual(shown.skipped.map((entry) => [entry.name, entry.reason]), [['My Note', 'name']], `${cell}: the name outside the grammar is reported`)
+        if (['unreadable', 'directory', 'fifo', 'symlink-loop'].includes(cacheState)) assert.ok(shown.cacheError !== undefined, `${cell}: the unusable cache is reported`)
+        const saved = await Promise.race([saveMemory(dir, { name: 'added', description: 'd', type: 'user', title: 'Added', hook: 'added later', content: 'c', sessionId: 's' }), timeout])
+        assert.ok(existsSync(join(dir, 'added.md')), `${cell}: the save commits`)
+        if (cacheState === 'directory') assert.ok(saved.indexError !== undefined, `${cell}: a cache that cannot be replaced is reported beside the committed save`)
+        const removed = await Promise.race([deleteMemory(dir, 'added'), timeout])
+        assert.equal(removed.removedFile, true, `${cell}: the delete commits`)
+        assert.ok(!existsSync(join(dir, 'added.md')))
+        const after = await Promise.race([projectIndex(dir), timeout])
+        assert.ok(after.text.includes(`${expectedLine}\n`) && !after.text.includes('added.md'), `${cell}: the projection follows the entry files`)
+      } finally {
+        // Restore the modes the cell took away, so the scratch directory can be removed; a cell that made no such file has nothing to restore.
+        for (const file of ['MEMORY.md', 'locked.md']) if (existsSync(join(dir, file))) chmodSync(join(dir, file), 0o644)
+      }
+    }
+  }
 })
 
 test('the reserved name "memory" is refused before anything touches the disk', async () => {
@@ -359,7 +435,7 @@ test('memory_save and memory_delete write the calling session\'s own store throu
 
   const removed = await call(ctx, DELETE_TOOL_NAME, { name: 'deploy-host' }, agent)
   assert.equal(removed.isError, false)
-  assert.deepEqual(removed.value, { path: join(dir, 'deploy-host.md'), existed: true, indexLines: 3 })
+  assert.deepEqual(removed.value, { path: join(dir, 'deploy-host.md'), existed: true, indexLines: 3, indexNote: '' })
   assert.equal(text(removed), 'Deleted memory deploy-host.')
   assert.equal(existsSync(join(dir, 'deploy-host.md')), false)
   const missing = await call(ctx, DELETE_TOOL_NAME, { name: 'deploy-host' }, agent)

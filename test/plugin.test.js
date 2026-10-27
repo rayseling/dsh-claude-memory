@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, utimesSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -284,7 +284,7 @@ test('a blank window of an index that continues past it is not blank', async () 
   const first = await run(listener, { agent })
   assert.equal(first.messages.length, 2)
   const text = first.messages[1].content[0].text
-  assert.ok(text.includes('Only the beginning of this index is shown'), 'shown as a truncated index, not withdrawn as blank')
+  assert.ok(text.includes('Only part of this index is shown'), 'shown as a truncated index, not withdrawn as blank')
   assert.ok(!text.includes('no longer available'))
   commitAll(commit, agent.session, first, 1)
   assert.equal((await run(listener, { agent })).messages.length, 1)
@@ -322,7 +322,7 @@ test('the write tools refuse subagents without includeSubagents and read-only se
   assert.equal((await sharedSave.execute(args, exec({ cwd: project, origin: 'subagent' }))).created, true)
 })
 
-test('an own store that cannot be inspected enters nothing this turn, even when the Claude Code index could', async () => {
+test('an own store whose directory cannot be listed degrades to "not loaded" while the Claude Code section still enters', async () => {
   const { ownHome, project } = seedOwn()
   const { home } = seedProject()
   const claudeDir = join(home, 'projects', slugOf(project), 'memory')
@@ -345,8 +345,12 @@ test('an own store that cannot be inspected enters nothing this turn, even when 
   try {
     if (!inspectable) {
       const next = await run(listener, { agent })
-      assert.equal(next.messages.length, 1, 'a changed Claude index would enter a message without the own section: nothing entered, no withdrawal')
-      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('cannot inspect the own memory index')))
+      assert.equal(next.messages.length, 2, 'the own section is present, degraded, so the message is a replacement with the changed Claude index')
+      const text = next.messages[1].content[0].text
+      assert.ok(text.includes('- claude line changed'))
+      assert.ok(text.includes('is not loaded in this session'), 'the own section says its index is not loaded')
+      assert.ok(!text.includes('- [Deploy host]'))
+      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes(`cannot list ${ownDir}`)))
     }
   } finally {
     chmodSync(ownDir, 0o755)
@@ -837,7 +841,7 @@ test('a memory the model writes is entered on the next turn, and a vanished Clau
   assert.equal(gone.messages[1].source.path, join(dir, 'MEMORY.md'))
 })
 
-test('an own store without entries reads as no entries yet; an unreadable index file degrades to "not loaded" and keeps the Claude Code section', async () => {
+test('an own store without entries reads as no entries yet; an unreadable index cache hides nothing and is warned about once', async () => {
   const { ownHome, project, ownPath } = seedOwn([])
   writeFileSync(ownPath, '\n\n')
   const { home } = seedProject('- claude line\n')
@@ -855,13 +859,16 @@ test('an own store without entries reads as no entries yet; an unreadable index 
   try { readFileSync(ownPath) } catch { readable = false }
   try {
     if (!readable) {
-      const degraded = await run(listener, { agent })
-      assert.equal(degraded.messages.length, 2)
-      const text = degraded.messages[1].content[0].text
+      const shown = await run(listener, { agent })
+      assert.equal(shown.messages.length, 2)
+      const text = shown.messages[1].content[0].text
       assert.ok(text.includes('- claude line'), 'the Claude Code section still enters')
-      assert.ok(text.includes('is not loaded in this session'), 'the own section says the index is not loaded')
-      assert.ok(!text.includes('- [a](a.md)'))
-      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes(ownPath)), 'the unreadable index is warned about')
+      assert.ok(text.includes('- [a](a.md) — b'), 'the readable entry is shown: the cache is not load-bearing')
+      assert.ok(text.includes('This index is shown in full'), 'nothing is hidden, so the claim stands')
+      assert.ok(!text.includes('is not loaded in this session'))
+      assert.equal(logs.filter(([level, line]) => level === 'warn' && line.includes(`${ownPath} cannot be used`)).length, 1, 'the unusable cache is warned about once')
+      assert.equal(logs.filter(([level, line]) => level === 'warn' && line.includes(`cannot rewrite the index cache ${ownPath}`)).length, 0, 'rename over a mode-000 file succeeds, so the cache is repaired')
+      assert.equal(readFileSync(ownPath, 'utf8'), '- [a](a.md) — b\n')
     }
   } finally {
     chmodSync(ownPath, 0o644)
@@ -883,8 +890,10 @@ test('the own store is shared by every worktree of a repository', async () => {
   assert.equal(fromWorktree.messages[1].source.digest, fromMain.messages[1].source.digest)
 })
 
-test('with dsh read off the own store is still announced for writing, its index unread', async () => {
+test('with dsh read off the own store is still announced for writing, its index unread but its cache kept current', async () => {
   const { ownHome, project, ownPath } = seedOwn()
+  // A cache an overlapping write left behind: the model is told to `cat` this file before saving, so it must be repaired even unread.
+  writeFileSync(ownPath, '- [Ghost](ghost.md) — no such entry\n')
   const { listener, commit } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: false, dsh: false } })
   const agent = fakeAgent({ cwd: project })
   const first = await run(listener, { agent })
@@ -892,6 +901,7 @@ test('with dsh read off the own store is still announced for writing, its index 
   const text = first.messages[1].content[0].text
   assert.ok(text.includes(`Its index ${ownPath} is not loaded in this session; \`cat\` it before saving`))
   assert.ok(!text.includes('- [Deploy host](deploy-host.md)'), 'the index content is not read')
+  assert.equal(readFileSync(ownPath, 'utf8'), '- [Deploy host](deploy-host.md) — 部署机是 mini\n', 'the cache the model will cat is current')
   assert.ok(text.includes('Save a memory with the `memory_save` tool'))
   commitAll(commit, agent.session, first, 1)
   assert.equal((await run(listener, { agent })).messages.length, 1, 'the static section is entered once')
