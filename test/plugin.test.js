@@ -50,12 +50,13 @@ const lastModeEvent = (session) => session.snapshotEvents().filter((event) => ev
  * store on) have their own tests. The own store's home always points into a
  * scratch directory so no test reads the developer's `~/.dsh/memory`.
  */
-function mount(config = {}, { withCommands = false, commandError = undefined } = {}) {
+function mount(config = {}, { withCommands = false, commandError = undefined, withTools = true, expectDsh = undefined, sandboxMode = undefined } = {}) {
   const logs = []
   let listener
   const definitions = new Map()
   const states = new WeakMap()
   const commands = []
+  const tools = []
   const ctx = {
     logger: { info: (line) => logs.push(['info', line]), warn: (line) => logs.push(['warn', line]) },
     on(event, handler) {
@@ -63,7 +64,16 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
       listener = handler
       return () => {}
     },
+    // Optional services the plugin asks for by name: the sandbox policy is the only one.
+    get(name) {
+      if (name === 'sandboxPolicy' && sandboxMode !== undefined) return { resolve: () => ({ mode: sandboxMode }) }
+      return undefined
+    },
     inject(deps, callback) {
+      if (deps.includes('tools')) {
+        if (withTools) callback({ tools: { register(definition) { tools.push(definition); return () => {} } } })
+        return
+      }
       if (!withCommands || !deps.includes('commands')) return
       callback({
         commands: {
@@ -100,7 +110,7 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
   assert.deepEqual(modeDefinition.init(), { read: {} })
   assert.deepEqual(
     modeDefinition.wire.view({ read: { claude: false, dsh: true } }),
-    { sources: config.ownMemory ? [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }] : [{ id: 'claude', enabled: false }] },
+    { sources: (expectDsh ?? config.ownMemory) ? [{ id: 'claude', enabled: false }, { id: 'dsh', enabled: true }] : [{ id: 'claude', enabled: false }] },
     'the dsh source exists only with an own store',
   )
   assert.deepEqual(modeDefinition.wire.viewSchema.parse({ sources: [{ id: 'dsh', enabled: false, extra: 1 }] }), { sources: [{ id: 'dsh', enabled: false }] })
@@ -110,7 +120,7 @@ function mount(config = {}, { withCommands = false, commandError = undefined } =
       states.get(session).set(key, unit.apply(prior, event))
     }
   }
-  return { listener, logs, commit, definition, modeDefinition, commands, ctx }
+  return { listener, logs, commit, definition, modeDefinition, commands, tools, ctx }
 }
 
 const userMessage = (text) => ({ id: `u-${text}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
@@ -222,9 +232,70 @@ test('ownMemory: false refuses the dsh source in /memory and reports only claude
   assert.deepEqual(commands[0].handler({ agent, rawInput: 'off' }).text, 'Memory read off: claude', 'a bare off touches only configured sources')
 })
 
-test('a relative ownMemoryHome is refused at mount', () => {
-  assert.throws(() => mount({ ownMemory: true, ownMemoryHome: 'relative/memory' }), /ownMemoryHome must be an absolute path/)
-  mount({ ownMemory: false, ownMemoryHome: 'relative/memory' })
+test('a relative ownMemoryHome turns the own store off with a warning instead of failing the mount', async () => {
+  const { home, project } = seedProject()
+  const { listener, logs, tools, modeDefinition } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: 'relative/memory' }, { expectDsh: false })
+  assert.match(logs[0][1], /ownMemoryHome must be an absolute path/)
+  assert.equal(tools.length, 0, 'no write tools without a store')
+  assert.deepEqual(modeDefinition.wire.view({ read: {} }).sources.map((source) => source.id), ['claude'])
+  const text = (await run(listener, { agent: fakeAgent({ cwd: project }) })).messages[1].content[0].text
+  assert.ok(!text.includes('memory_save'), 'the Claude Code index still enters, without an own section')
+})
+
+test('a host without a tool registry gets the own section without writing rules, and a warning once', async () => {
+  const ownHome = scratch()
+  const project = scratch()
+  const { listener, logs, tools } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome }, { withTools: false })
+  assert.equal(tools.length, 0)
+  const agent = fakeAgent({ cwd: project })
+  const text = (await run(listener, { agent })).messages[1].content[0].text
+  assert.ok(text.includes('This host offers no memory tools, so the store cannot be written from this session.'))
+  assert.ok(!text.includes('memory_save'))
+  await run(listener, { agent })
+  assert.equal(logs.filter(([level, line]) => level === 'warn' && line.includes('no memory tools')).length, 1)
+})
+
+test('the write tools refuse subagents without includeSubagents and read-only sessions', async () => {
+  const ownHome = scratch()
+  const project = scratch()
+  const withPolicy = mount({ ownMemory: true, ownMemoryHome: ownHome }, { sandboxMode: 'read-only' })
+  const save = withPolicy.tools.find((tool) => tool.name === 'memory_save')
+  const args = { name: 'x', type: 'user', title: 't', description: 'd', hook: 'h', content: 'c' }
+  const exec = (header) => ({ name: 'memory_save', agent: { session: { id: 's', header } } })
+  await assert.rejects(save.execute(args, exec({ cwd: project })), /read-only/)
+  const open = mount({ ownMemory: true, ownMemoryHome: ownHome })
+  const openSave = open.tools.find((tool) => tool.name === 'memory_save')
+  await assert.rejects(openSave.execute(args, exec({ cwd: project, origin: 'subagent' })), /not available to subagents/)
+  await assert.rejects(openSave.execute({ ...args, title: '  ' }, exec({ cwd: project })), /title must not be empty/)
+  const saved = await openSave.execute(args, exec({ cwd: project }))
+  assert.equal(saved.created, true)
+  const shared = mount({ ownMemory: true, ownMemoryHome: scratch(), includeSubagents: true })
+  const sharedSave = shared.tools.find((tool) => tool.name === 'memory_save')
+  assert.equal((await sharedSave.execute(args, exec({ cwd: project, origin: 'subagent' }))).created, true)
+})
+
+test('an own store that cannot be located never withdraws a shown index', async () => {
+  const { ownHome, project } = seedOwn()
+  const { listener, commit, logs } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: false, dsh: true } })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.equal(first.messages.length, 2)
+  commitAll(commit, agent.session, first, 1)
+  // A `.git` file that cannot be read makes canonicalRoot throw, so the own store cannot be located.
+  const { chmodSync, readFileSync } = await import('node:fs')
+  writeFileSync(join(project, '.git'), 'gitdir: /nowhere\n')
+  chmodSync(join(project, '.git'), 0o000)
+  let readable = true
+  try { readFileSync(join(project, '.git')) } catch { readable = false }
+  try {
+    if (!readable) {
+      const next = await run(listener, { agent })
+      assert.equal(next.messages.length, 1, 'the only section could not be checked: nothing entered, no withdrawal')
+      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('own memory index')))
+    }
+  } finally {
+    chmodSync(join(project, '.git'), 0o644)
+  }
 })
 
 test('parses the /memory argument grammar', () => {

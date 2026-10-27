@@ -69,23 +69,35 @@ export function renderMemoryFile({ name, description, type, content, sessionId, 
 }
 
 /**
+ * Index-line text with angle brackets replaced by their full-width forms, so
+ * a title or hook can never close or open a tag in the message the index is
+ * later framed in.
+ * @param {string} text
+ * @returns {string}
+ */
+function tagSafe(text) {
+  return oneLine(text).replace(/</g, '＜').replace(/>/g, '＞')
+}
+
+/**
  * The index line for one memory: `- [Title](name.md) — hook`.
  * @param {{ name: string, title: string, hook: string }} entry
  * @returns {string}
  */
 export function renderIndexLine({ name, title, hook }) {
-  return `- [${oneLine(title).replace(/[[\]]/g, '')}](${name}.md) — ${oneLine(hook)}`
+  return `- [${tagSafe(title).replace(/[[\]]/g, '')}](${name}.md) — ${tagSafe(hook)}`
 }
 
 /**
- * Whether an index line points at `<name>.md`. The link target is the one
- * part of a line the writer controls, so it is the identity.
+ * Whether an index line is the entry for `<name>.md`: the line's leading
+ * link, the one part of a line the writer controls, points at it. A later
+ * occurrence inside a hook is not an identity.
  * @param {string} line
  * @param {string} name
  * @returns {boolean}
  */
 function pointsAt(line, name) {
-  return new RegExp(`\\]\\(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.md\\)`).test(line)
+  return new RegExp(`^-\\s+\\[[^\\]]*\\]\\(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.md\\)`).test(line)
 }
 
 /**

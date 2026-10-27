@@ -10,9 +10,9 @@
  * message with a producer-owned source (`plugin:claude-memory`, form
  * `snapshot`). The own-store section is present whenever that store is
  * enabled, entries or not, because it carries the directory and the writing
- * rules the model needs to create the first memory. The plugin itself never
- * writes a memory file: the model does, with its ordinary file tools, and the
- * next turn re-enters the changed index. The message is an ordinary
+ * rules the model needs to create the first memory. The model writes through
+ * the two tools described below, and the next turn re-enters the changed
+ * index. The message is an ordinary
  * `user/message` session event, so it replays, compacts, and resumes like the
  * rest of the history and the model-visible state stays reconstructable from
  * the log.
@@ -42,7 +42,9 @@
  * workspace and temp directories, so the store under `~/.dsh` would otherwise
  * need an approved escalation per write. The tools also fill the host-side
  * frontmatter (`originSessionId`, `modified`), serialize index updates per
- * directory, and can only reach the own store, never Claude Code's.
+ * directory, and can only reach the own store, never Claude Code's. As in
+ * Claude Code, a subagent gets no memory tools unless `includeSubagents` is
+ * set, and a session whose sandbox policy is `read-only` cannot write.
  *
  * Topic files are not loaded: the framing tells the model to `cat` one only
  * when the task relates to it, which is Claude Code's on-demand rule.
@@ -271,11 +273,17 @@ export function apply(ctx, config) {
   const claudeHome = expandHome(config.claudeHome)
   const ownMemoryHome = expandHome(config.ownMemoryHome)
   // A relative home would resolve against the server's cwd here and against
-  // the session's cwd in the model's eyes; refuse it at mount.
-  if (config.ownMemory && !isAbsolute(ownMemoryHome)) throw new TypeError(`claude-memory: ownMemoryHome must be an absolute path (got ${JSON.stringify(config.ownMemoryHome)})`)
+  // the session's cwd in the model's eyes; run without the own store instead.
+  let ownMemory = config.ownMemory
+  if (ownMemory && !isAbsolute(ownMemoryHome)) {
+    ctx.logger.warn(`claude-memory: ownMemoryHome must be an absolute path, got ${JSON.stringify(config.ownMemoryHome)}; the own store is off`)
+    ownMemory = false
+  }
   const limits = { maxLines: config.maxLines, maxChars: config.maxChars }
   /** Sources this deployment can read: `dsh` exists only with an own store. */
-  const sources = SOURCES.filter((id) => id !== 'dsh' || config.ownMemory)
+  const sources = SOURCES.filter((id) => id !== 'dsh' || ownMemory)
+  /** Whether the host composed a tool registry and the write tools are on it. */
+  let toolsRegistered = false
   /** Bounded index text per path, reused while the file's size and mtime hold. */
   const bounded = new Map()
   /** Paths already warned about per session, so a persistent read failure logs once. */
@@ -313,14 +321,23 @@ export function apply(ctx, config) {
     },
   })
 
-  // Optional: the write tools need the tool registry. Without it the store is
-  // announced read-only in effect; the framing still names the tools, so a
-  // host without `tools` should set ownMemory: false.
-  if (config.ownMemory) {
+  // Optional: the write tools need the tool registry. Without it the own
+  // section says the store cannot be written from this host.
+  if (ownMemory) {
     ctx.inject(['tools'], (toolCtx) => {
+      /**
+       * The calling session's own memory directory, or a refusal: a call
+       * without a session cwd has no project, a subagent gets no memory
+       * unless configured (as in Claude Code), and a session confined to
+       * `read-only` by the sandbox policy may not write anywhere.
+       */
       const dirOf = async (exec) => {
-        const cwd = exec.agent?.session?.header?.cwd
+        const session = exec.agent?.session
+        const cwd = session?.header?.cwd
         if (cwd === undefined) throw new Error(`${exec.name ?? 'memory tool'} needs a session with a working directory; this call has none`)
+        if (session.header.origin === 'subagent' && !config.includeSubagents) throw new Error('memory is not available to subagents in this profile (includeSubagents is off)')
+        const policy = ctx.get('sandboxPolicy')
+        if (policy !== undefined && policy.resolve({ session }).mode === 'read-only') throw new Error('this session is read-only under the file policy; memory cannot be written')
         return ownMemoryDir(cwd, ownMemoryHome)
       }
       /**
@@ -369,7 +386,9 @@ export function apply(ctx, config) {
           isConcurrencySafe: () => false,
           async execute(args, exec) {
             if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens), got ${JSON.stringify(args.name)}`)
-            if (args.content.trim().length === 0) throw new Error('content must not be empty')
+            for (const field of ['title', 'description', 'hook', 'content']) {
+              if (args[field].trim().length === 0) throw new Error(`${field} must not be empty`)
+            }
             const dir = await dirOf(exec)
             const saved = await saveMemory(dir, { ...args, sessionId: String(exec.agent.session.id) })
             return { path: saved.path, created: saved.created, indexLines: saved.indexLines, indexChars: saved.indexChars, indexNote: indexVerdict(saved) }
@@ -401,6 +420,7 @@ export function apply(ctx, config) {
             return { path: removed.path, existed: removed.removedFile || removed.removedLines > 0, indexLines: removed.indexLines }
           },
         }))
+        toolsRegistered = true
       } catch (error) {
         // A name collision on an optional tool must not disable injection.
         ctx.logger.warn(`claude-memory: cannot register the memory tools: ${error.message}`)
@@ -496,8 +516,10 @@ export function apply(ctx, config) {
    * to it; its index is read only when the `dsh` switch is on, and an index
    * that cannot be inspected or read degrades to "not loaded" (the model is
    * told to read it before saving) so the Claude Code section still enters.
+   * The result also says whether a store that should have been shown could
+   * not be inspected, so the caller never mistakes that for "nothing to show".
    * @param {Record<string, boolean>} read - resolved switches.
-   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean } } | undefined>}
+   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean, writable: boolean }, incomplete: boolean } | undefined>}
    */
   const currentStores = async (session, cwd, signal, read) => {
     let located
@@ -509,26 +531,28 @@ export function apply(ctx, config) {
       return undefined
     }
     signal.throwIfAborted()
-    const stores = {}
+    const stores = { incomplete: false }
     if (located !== undefined) {
       const index = await currentIndex(session, located)
       if (index.kind === 'error') return undefined
       if (index.kind === 'text') stores.claude = { path: located.path, text: index.text, truncated: index.truncated }
     }
-    if (config.ownMemory) {
+    if (ownMemory) {
       let own
       try {
         own = await locateOwnIndex(cwd, ownMemoryHome, { stat: read.dsh })
       } catch (error) {
         // Without a canonical root or a stat there is no directory to vouch for; leave the section out this turn.
         warnOnce(session, `${cwd}#own`, `claude-memory: cannot inspect the own memory index for ${cwd}: ${error.message}`)
+        stores.incomplete = true
       }
       if (own !== undefined) {
-        stores.own = { path: own.path, truncated: false, loaded: read.dsh }
+        if (!toolsRegistered) warnOnce(session, 'tools', `claude-memory: the host registered no memory tools; session ${session.id} is told its own store cannot be written`)
+        stores.own = { path: own.path, truncated: false, loaded: read.dsh, writable: toolsRegistered }
         if (read.dsh && own.size !== undefined) {
           const index = await currentIndex(session, own)
           if (index.kind === 'error') stores.own.loaded = false
-          else if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true }
+          else if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true, writable: toolsRegistered }
         }
       }
     }
@@ -546,7 +570,7 @@ export function apply(ctx, config) {
     if (mode === undefined) throw new Error('claude-memory requires its mode projection to be registered')
     const read = resolveRead(mode)
     // Nothing to read and nowhere to write: the turn touches no file.
-    if (!read.claude && !config.ownMemory) return decision
+    if (!read.claude && !ownMemory) return decision
     if (session.header.origin === 'subagent' && !config.includeSubagents) return decision
     const cwd = session.header.cwd
     if (cwd === undefined) return decision
@@ -556,8 +580,9 @@ export function apply(ctx, config) {
     if (stores === undefined) return decision
     let message
     if (stores.claude === undefined && stores.own === undefined) {
-      // Nothing to show: withdraw an index the model has seen, otherwise stay silent.
-      if (state.digest === null || state.path === null) return decision
+      // Nothing to show: withdraw an index the model has seen, otherwise stay
+      // silent. A store that could not be inspected is not "nothing to show".
+      if (stores.incomplete || state.digest === null || state.path === null) return decision
       message = snapshotMessage(renderWithdrawnMessage(state.path), state.path)
     } else {
       message = snapshotMessage(renderMemoryMessage({ ...stores, maxLines: limits.maxLines }), stores.claude?.path ?? stores.own.path)
