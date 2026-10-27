@@ -26,6 +26,7 @@ import {
   projectionStateSchema,
 } from '../src/index.js'
 import { slugOf } from '../src/locate.js'
+import { renderMemoryFile } from '../src/store.js'
 
 const scratch = () => realpathSync(mkdtempSync(join(tmpdir(), 'dsh-claude-memory-plugin-')))
 
@@ -764,13 +765,19 @@ test('expands ~ in claudeHome', async () => {
   assert.equal((await run(listener, { agent: fakeAgent({ cwd: scratch() }) })).messages.length, 1)
 })
 
-/** A project whose own-store index is already written; the Claude Code home stays empty. */
-function seedOwn(text = '- [Deploy host](deploy-host.md) — 部署机是 mini\n') {
+/** Write one own-store entry file the way the save tool does; the index is projected from it. */
+function seedEntry(dir, name, title, hook) {
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, `${name}.md`), renderMemoryFile({ name, description: hook, title, hook, type: 'project', content: 'body', sessionId: 's', modified: new Date(0) }))
+}
+
+/** A project whose own store already holds entries (one by default); the Claude Code home stays empty. */
+function seedOwn(entries = [['deploy-host', 'Deploy host', '部署机是 mini']]) {
   const ownHome = scratch()
   const project = scratch()
   const dir = join(ownHome, slugOf(project))
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'MEMORY.md'), text)
+  for (const [name, title, hook] of entries) seedEntry(dir, name, title, hook)
   return { ownHome, project, ownPath: join(dir, 'MEMORY.md') }
 }
 
@@ -791,9 +798,8 @@ test('with the own store on, a project without any memory still gets the directo
 test('with the own store on, both indexes enter as one snapshot keyed by the Claude Code path', async () => {
   const { home, project, path } = seedProject('- [Reply in Chinese](reply-in-chinese.md) — 用中文回复\n')
   const ownHome = scratch()
-  mkdirSync(join(ownHome, slugOf(project)), { recursive: true })
+  seedEntry(join(ownHome, slugOf(project)), 'deploy-host', 'Deploy host', '部署机是 mini')
   const ownPath = join(ownHome, slugOf(project), 'MEMORY.md')
-  writeFileSync(ownPath, '- [Deploy host](deploy-host.md) — 部署机是 mini\n')
   const { listener } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome })
   const decision = await run(listener, { agent: fakeAgent({ cwd: project }) })
   assert.equal(decision.messages.length, 2)
@@ -815,8 +821,7 @@ test('a memory the model writes is entered on the next turn, and a vanished Clau
   commitAll(commit, agent.session, first, 1)
   assert.equal((await run(listener, { agent })).messages.length, 1, 'unchanged: nothing entered')
   const dir = join(ownHome, slugOf(project))
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'MEMORY.md'), '- [Deploy host](deploy-host.md) — 部署机是 mini\n')
+  seedEntry(dir, 'deploy-host', 'Deploy host', '部署机是 mini')
   const written = await run(listener, { agent })
   assert.equal(written.messages.length, 2)
   assert.ok(written.messages[1].content[0].text.includes('- [Deploy host](deploy-host.md)'))
@@ -832,8 +837,9 @@ test('a memory the model writes is entered on the next turn, and a vanished Clau
   assert.equal(gone.messages[1].source.path, join(dir, 'MEMORY.md'))
 })
 
-test('a blank own index reads as no entries yet; an unreadable one degrades to "not loaded" and keeps the Claude Code section', async () => {
-  const { ownHome, project, ownPath } = seedOwn('\n\n')
+test('an own store without entries reads as no entries yet; an unreadable index file degrades to "not loaded" and keeps the Claude Code section', async () => {
+  const { ownHome, project, ownPath } = seedOwn([])
+  writeFileSync(ownPath, '\n\n')
   const { home } = seedProject('- claude line\n')
   // The Claude index lives under a different project root; point this project's slug at it.
   const claudeDir = join(home, 'projects', slugOf(project), 'memory')
@@ -843,7 +849,7 @@ test('a blank own index reads as no entries yet; an unreadable one degrades to "
   const agent = fakeAgent({ cwd: project })
   assert.ok((await run(listener, { agent })).messages[1].content[0].text.includes('It has no entries yet'))
   const { chmodSync, readFileSync } = await import('node:fs')
-  writeFileSync(ownPath, '- [a](a.md) — b\n')
+  seedEntry(join(ownHome, slugOf(project)), 'a', 'a', 'b')
   chmodSync(ownPath, 0o000)
   let readable = true
   try { readFileSync(ownPath) } catch { readable = false }

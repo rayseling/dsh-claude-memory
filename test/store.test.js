@@ -9,16 +9,19 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import {
-  MEMORY_TYPES, deleteMemory, indexLineName, indexOrder, isMemoryName, judgeIndex, listEntries, parseFrontmatter, renderIndex, renderIndexLine, renderMemoryFile, saveMemory,
+  MEMORY_TYPES, deleteMemory, indexLineName, indexOrder, isEntryName, isMemoryName, judgeIndex, listEntries, parseFrontmatter, projectIndex, renderIndex, renderIndexLine,
+  renderMemoryFile, saveMemory, syncIndex,
 } from '../src/store.js'
 import { Config, DELETE_TOOL_NAME, SAVE_TOOL_NAME, apply } from '../src/index.js'
 import { slugOf } from '../src/locate.js'
 
 const scratch = () => realpathSync(mkdtempSync(join(tmpdir(), 'dsh-claude-memory-store-')))
 
-test('memory names are lower-case kebab-case', () => {
+test('memory names are lower-case kebab-case; entry names are any safe file stem', () => {
   for (const ok of ['a', 'reply-in-chinese', 'dsh-0-2-1']) assert.equal(isMemoryName(ok), true, ok)
   for (const bad of ['', 'Reply', 'a--b', '-a', 'a-', 'a_b', 'a b', 'a/b', '../x', 'a.md', 'x'.repeat(101)]) assert.equal(isMemoryName(bad), false, bad)
+  for (const ok of ['a', 'reply-in-chinese', 'feedback_testing', 'Reply', 'a.b', 'a--b', 'a-']) assert.equal(isEntryName(ok), true, ok)
+  for (const bad of ['', '.hidden', '..', 'a b', 'a/b', 'a\\b', 'a(b)', 'a[b]', 'memory', 'MEMORY', 'x'.repeat(101)]) assert.equal(isEntryName(bad), false, bad)
   assert.deepEqual([...MEMORY_TYPES], ['user', 'feedback', 'project', 'reference'])
 })
 
@@ -124,10 +127,80 @@ test('saves from two processes all land in the index (web and headless share one
     execFile(process.execPath, [script, dir, prefix, '20'], (error, _stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve())
   })
   await Promise.all([run('web'), run('headless')])
-  const lines = readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean)
-  assert.equal(lines.length, 40, 'no index update is lost to a concurrent rewrite')
   assert.equal(readdirSync(dir).filter((entry) => entry.endsWith('.md') && entry !== 'MEMORY.md').length, 40)
-  assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
+  assert.equal((await projectIndex(dir)).indexLines, 40, 'the reader sees every entry whatever the two writers left on disk')
+  const synced = await syncIndex(dir)
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), synced.text, 'a read repairs the file')
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean).length, 40)
+  assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.')), [], 'no temp or lock files are left behind')
+})
+
+test('the reader projects the index from the entry files, so an index file an overlapping or interrupted write left behind hides nothing', async () => {
+  const dir = join(scratch(), 'store')
+  for (const name of ['a', 'b-1', 'b-2']) await saveMemory(dir, { name, description: 'd', type: 'project', title: name.toUpperCase(), hook: `hook ${name}`, content: 'c', sessionId: 's' })
+  const complete = readFileSync(join(dir, 'MEMORY.md'), 'utf8')
+  // The loser of an overlapping rebuild wrote a listing taken before b-2 existed.
+  writeFileSync(join(dir, 'MEMORY.md'), '- [A](a.md) — hook a\n- [B-1](b-1.md) — hook b-1\n')
+  let index = await projectIndex(dir)
+  assert.equal(index.text, complete)
+  assert.equal(index.stale, true)
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8').includes('b-2'), false, 'projecting does not write')
+  const synced = await syncIndex(dir)
+  assert.equal(synced.written, true)
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), complete)
+  assert.equal((await syncIndex(dir)).written, false, 'an index that agrees with its entries is left alone')
+  // A writer that crashed between its entry file and the index: the entry is listed on the next read.
+  writeFileSync(join(dir, 'c.md'), renderMemoryFile({ name: 'c', description: 'd', title: 'C', hook: 'hook c', type: 'user', content: 'c', sessionId: 's', modified: new Date() }))
+  rmSync(join(dir, 'MEMORY.md'))
+  index = await projectIndex(dir)
+  assert.deepEqual(indexOrder(index.text), ['a', 'b-1', 'b-2', 'c'], 'without a previous index the entries follow their write order')
+  // A stale line for an entry whose file changed is replaced by the file's fields.
+  writeFileSync(join(dir, 'MEMORY.md'), '- [C](c.md) — OLD\n')
+  await saveMemory(dir, { name: 'c', description: 'd', type: 'user', title: 'C', hook: 'NEW', content: 'c', sessionId: 's', modified: new Date(0) })
+  assert.ok(readFileSync(join(dir, 'MEMORY.md'), 'utf8').startsWith('- [C](c.md) — NEW\n'))
+  assert.equal((await projectIndex(join(scratch(), 'never'))).text, '', 'an absent store projects to no entries')
+})
+
+test('hand-written entries keep the index line they have, index under name and description without one, and are deletable', async () => {
+  const dir = join(scratch(), 'store')
+  mkdirSync(dir, { recursive: true })
+  // Copied from Claude Code: not kebab-case, no title or hook, and a block-scalar description.
+  writeFileSync(join(dir, 'feedback_testing.md'), '---\nname: feedback_testing\ndescription: |-\n  run the\n  tests first\nmetadata:\n  type: feedback\n---\n\nbody\n')
+  writeFileSync(join(dir, 'old-entry.md'), '---\nname: old-entry\ndescription: "from 0.4.0"\n---\n\nbody\n')
+  writeFileSync(join(dir, 'MEMORY.md'), '- [Old entry, as written by hand](old-entry.md) — a hand-written hook\n')
+  assert.equal((await projectIndex(dir)).text, '- [Old entry, as written by hand](old-entry.md) — a hand-written hook\n- [feedback_testing](feedback_testing.md) — run the tests first\n')
+  const saved = await saveMemory(dir, { name: 'tooled', description: 'd', type: 'project', title: 'Tooled', hook: 't', content: 'c', sessionId: 's' })
+  assert.equal(saved.indexLines, 3)
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Old entry, as written by hand](old-entry.md) — a hand-written hook\n- [feedback_testing](feedback_testing.md) — run the tests first\n- [Tooled](tooled.md) — t\n')
+  const removed = await deleteMemory(dir, 'feedback_testing')
+  assert.equal(removed.removedFile, true)
+  assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Old entry, as written by hand](old-entry.md) — a hand-written hook\n- [Tooled](tooled.md) — t\n')
+  await assert.rejects(saveMemory(dir, { name: 'feedback_testing', description: 'd', type: 'project', title: 'x', hook: 'x', content: 'c', sessionId: 's' }), TypeError, 'the save tool still names new entries in kebab-case')
+})
+
+test('an entry that cannot be read is reported and skipped, and neither blocks the index nor a save or delete', async (t) => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return t.skip('root reads every file')
+  const dir = join(scratch(), 'store')
+  for (const name of ['readable', 'locked']) await saveMemory(dir, { name, description: 'd', type: 'project', title: name, hook: 'h', content: 'c', sessionId: 's' })
+  const { chmodSync, symlinkSync } = await import('node:fs')
+  symlinkSync(join(dir, 'readable.md'), join(dir, 'linked.md'))
+  chmodSync(join(dir, 'locked.md'), 0o000)
+  try {
+    const listed = await listEntries(dir)
+    assert.deepEqual(listed.entries.map((entry) => entry.name), ['readable'], 'symbolic links are not followed')
+    assert.deepEqual(listed.skipped.map((entry) => entry.name), ['locked'])
+    assert.match(listed.skipped[0].error.message, /EACCES/)
+    const index = await projectIndex(dir)
+    assert.deepEqual(index.skipped.map((entry) => entry.name), ['locked'])
+    assert.equal(index.text, '- [readable](readable.md) — h\n')
+    const saved = await saveMemory(dir, { name: 'more', description: 'd', type: 'project', title: 'More', hook: 'h', content: 'c', sessionId: 's' })
+    assert.equal(saved.indexLines, 2)
+    await deleteMemory(dir, 'readable')
+    assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [More](more.md) — h\n')
+  } finally {
+    chmodSync(join(dir, 'locked.md'), 0o644)
+  }
+  assert.equal((await projectIndex(dir)).text, '- [More](more.md) — h\n- [locked](locked.md) — h\n', 'readable again, the entry is back')
 })
 
 test('the index is a projection of the entry files, rebuilt on every write', async () => {
@@ -138,6 +211,7 @@ test('the index is a projection of the entry files, rebuilt on every write', asy
   writeFileSync(join(dir, 'gamma.md'), '---\nname: gamma\ndescription: "hand: written"\n---\n\nbody\n')
   writeFileSync(join(dir, 'notes.txt'), 'not a memory')
   writeFileSync(join(dir, 'Bad Name.md'), 'not a memory either')
+  writeFileSync(join(dir, '.hidden.md'), 'nor this')
   // A hand edit to the index itself is replaced on the next write; its order survives.
   writeFileSync(join(dir, 'MEMORY.md'), '- [Beta](beta.md) — edited by hand\n- [Alpha](alpha.md) — a\n')
   const saved = await saveMemory(dir, { name: 'delta', description: 'dd', type: 'project', title: 'Delta', hook: 'd', content: 'c', sessionId: 's' })
@@ -168,6 +242,13 @@ test('parseFrontmatter reads the scalar fields this store writes and tolerates h
   assert.deepEqual(parseFrontmatter('no frontmatter\n'), {})
   assert.deepEqual(parseFrontmatter('---\r\nname: crlf\r\ntitle: bare value\r\n---\r\nbody'), { name: 'crlf', title: 'bare value' })
   assert.deepEqual(parseFrontmatter('---\nname: x\n---'), { name: 'x' }, 'a frontmatter block that ends the file')
+  assert.deepEqual(parseFrontmatter('﻿---\nname: bom\n---\n'), { name: 'bom' }, 'a byte order mark is ignored')
+  assert.deepEqual(parseFrontmatter("---\ntitle: 'it''s quoted'\nhook: bare # a comment\nempty:\n---\n"), { title: "it's quoted", hook: 'bare' })
+  assert.deepEqual(
+    parseFrontmatter('---\ndescription: |-\n  first line\n\n  third: line\nhook: >\n  folded\n  text\ntitle: after\n---\n'),
+    { description: 'first line\n\nthird: line', hook: 'folded text', title: 'after' },
+    'block scalars take their indented lines',
+  )
 })
 
 test('concurrent saves and deletes from two processes converge on a complete index', async () => {
@@ -188,8 +269,9 @@ test('concurrent saves and deletes from two processes converge on a complete ind
   for (let round = 0; round < 3; round += 1) {
     await Promise.all([run(`web${round}`, 'churn'), run(`headless${round}`, 'churn'), run(`cli${round}`, 'save')])
     const files = readdirSync(dir).filter((entry) => entry.endsWith('.md') && entry !== 'MEMORY.md').map((entry) => entry.slice(0, -3)).sort()
-    const listed = indexOrder(readFileSync(join(dir, 'MEMORY.md'), 'utf8')).sort()
-    assert.deepEqual(listed, files, `round ${round}: the index lists exactly the entry files`)
+    assert.deepEqual(indexOrder((await projectIndex(dir)).text).sort(), files, `round ${round}: the reader lists exactly the entry files`)
+    await syncIndex(dir)
+    assert.deepEqual(indexOrder(readFileSync(join(dir, 'MEMORY.md'), 'utf8')).sort(), files, `round ${round}: after a read the file does too`)
     assert.equal(files.length, (round + 1) * (10 + 10 + 20))
   }
   assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.')), [], 'no temp files are left behind')
@@ -205,7 +287,7 @@ test('the reserved name "memory" is refused before anything touches the disk', a
   await assert.rejects(deleteMemory(dir, 'memory'), TypeError)
   await assert.rejects(deleteMemory(dir, 'Bad Name'), TypeError)
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), before, 'the index is untouched on a case-insensitive file system')
-  assert.deepEqual((await listEntries(dir)).map((entry) => entry.name), ['alpha', 'beta'])
+  assert.deepEqual((await listEntries(dir)).entries.map((entry) => entry.name), ['alpha', 'beta'])
   assert.deepEqual(readdirSync(dir).sort(), ['MEMORY.md', 'alpha.md', 'beta.md'])
 })
 
@@ -261,6 +343,14 @@ test('memory_save and memory_delete write the calling session\'s own store throu
   const badName = await call(ctx, SAVE_TOOL_NAME, { name: 'Bad Name', type: 'user', title: 't', description: 'd', hook: 'h', content: 'c' }, agent)
   assert.equal(badName.isError, true)
   assert.match(text(badName), /kebab-case/)
+  const badDelete = await call(ctx, DELETE_TOOL_NAME, { name: '../two' }, agent)
+  assert.equal(badDelete.isError, true)
+  assert.match(text(badDelete), /file stem/)
+  writeFileSync(join(dir, 'Copied_Entry.md'), '---\nname: Copied_Entry\ndescription: by hand\n---\n\nbody\n')
+  const copied = await call(ctx, DELETE_TOOL_NAME, { name: 'Copied_Entry' }, agent)
+  assert.equal(copied.isError, false, 'a hand-written entry outside the kebab-case grammar is still deletable')
+  assert.equal(copied.value.existed, true)
+  assert.equal(existsSync(join(dir, 'Copied_Entry.md')), false)
   const badType = await call(ctx, SAVE_TOOL_NAME, { name: 'ok', type: 'misc', title: 't', description: 'd', hook: 'h', content: 'c' }, agent)
   assert.equal(badType.isError, true, 'the registry enforces the type enum')
   const noAgent = await call(ctx, SAVE_TOOL_NAME, { name: 'ok', type: 'user', title: 't', description: 'd', hook: 'h', content: 'c' })

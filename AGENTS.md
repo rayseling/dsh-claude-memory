@@ -13,22 +13,22 @@ dsh-claude-memory 是一个 DeepSeek Harness(dsh)插件:每个会话第一步确
 
 ## 代码约定
 
-- 纯 ESM JS,无构建。`src/locate.js`(定位、读取、渲染)和 `src/store.js`(写条目与索引)只依赖 `node:fs`,全部异步,不 import 宿主包;`src/index.js` 只做挂载、注入与工具注册。新逻辑先问能不能放进前两者。
+- 纯 ESM JS,无构建。`src/locate.js`(定位、读取、渲染)和 `src/store.js`(条目读写、索引投影)只依赖 `node:fs`,全部异步,不 import 宿主包;`src/index.js` 只做挂载、注入与工具注册。新逻辑先放前两者。
 - 宿主接口只用八个:`agent/pre-step`(必须 `await next()`)、`session.header.cwd/origin`、`ctx.sessionProjections.register/stateOf`、`createUserMessage`、可选的 `ctx.commands.register`、`appendPluginRecord('plugin:claude-memory/mode')`、可选的 `ctx.tools.register`、可选的 `ctx.get('sandboxPolicy').resolve`。不碰 `session.eventAt`/`surface.nodes` 这类同步读历史的接口;多用一个就在这里记一笔。
 - 配置走 `@deepseek-ai/schemastery` 的 `Config`,默认值取 Claude Code 的值(例外:`readByDefault`、`ownMemory*`);不加 `DEFAULT_*` 常量。
 - 有 client:`dsh.client` 指向手写 `src/client.js`(无构建,`__ModuleLoader__.load` 闭包);文件缺失会让 `dsh web` 起不来,改完重启 web。
-- 测试用 `node --test`,不启动 dsh:`locate`/`store` 用临时目录,`plugin` 用假 ctx/agent 驱动监听器,模式记录与工具走真实 Session/ToolRuntime。peer 依赖靠仓库根的 `node_modules -> ~/.dsh/profiles/node_modules` 软链。
+- 测试用 `node --test`,不启动 dsh:`locate`/`store` 用临时目录,`plugin` 用假 ctx/agent 驱动监听器,模式记录与工具走真实 Session/ToolRuntime。peer 依赖靠仓库根的 `node_modules -> ~/.dsh/profiles/node_modules`。
 
 ## 安装与验证
 
 - profile 用 `link:` 装,并把包名加进 `dsh.profile.bundles`,缺一静默不加载。在 profile 目录跑 `pnpm add link:…`;经 deepseek-harness 的 `pnpm dsh plugin` 转发会因仓库 pnpm store 失败。
 - 改源码不用重装,重启 profile:web 是 launchd 的 `local.dsh.web`,`launchctl kickstart -k gui/$(id -u)/local.dsh.web`;headless 从 deepseek-harness 仓库 `pnpm dsh --profile headless "…"` 即时生效。
-- 验证看会话日志:`zstd -dc ~/.dsh/sessions/<cwd-slug>/<session>/session.v4.jsonl.zstd` 里应有一条 `"kind":"plugin:claude-memory"` 的 `user/message`,紧跟用户消息。问一个只有记忆才知道的问题,模型应零工具调用答出。
+- 验证看会话日志:`zstd -dc ~/.dsh/sessions/<cwd-slug>/<session>/session.v4.jsonl.zstd` 里应有一条 `"kind":"plugin:claude-memory"` 的 `user/message`,紧跟用户消息。问一个只有记忆才知道的问题,模型应零工具答出。
 - `pnpm dsh web --dump-config | grep claude-memory` 确认行已挂进 web 的 cordis 树。
 
 ## 不做的事
 
-- 只经 `memory_save`/`memory_delete` 写自己的目录,`~/.claude` 永远只读;不摘要、不检索;UI 只做按来源的读取菜单。
+- 条目只经 `memory_save`/`memory_delete` 写,`MEMORY.md` 只是条目的投影;`~/.claude` 永远只读;不摘要、不检索;UI 只做按来源的读取菜单。
 - 不碰 dsh 主仓库;dsh 的接口变了改这里。
 
 ## 开工规矩(skills)

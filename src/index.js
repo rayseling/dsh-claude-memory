@@ -56,13 +56,13 @@
 
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as dshSession from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { locateMemoryIndex, locateOwnIndex, ownMemoryDir, readIndex, renderMemoryMessage, renderWithdrawnMessage } from './locate.js'
-import { MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, saveMemory } from './store.js'
+import { locateMemoryIndex, locateOwnIndex, ownMemoryDir, readIndex, renderMemoryMessage, renderWithdrawnMessage, truncateIndex } from './locate.js'
+import { MEMORY_TYPES, deleteMemory, isEntryName, isMemoryName, judgeIndex, projectIndex, saveMemory, syncIndex } from './store.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'claude-memory'
@@ -424,7 +424,7 @@ export function apply(ctx, config) {
           },
           isConcurrencySafe: () => false,
           async execute(args, exec) {
-            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens) and not the reserved "memory", got ${JSON.stringify(args.name)}`)
+            if (!isEntryName(args.name)) throw new Error(`name must be a file stem as the index links it (letters, digits, dots, hyphens, underscores; no leading dot) and not the reserved "memory", got ${JSON.stringify(args.name)}`)
             const dir = await dirOf(exec)
             const removed = await deleteMemory(dir, args.name)
             return { path: removed.path, existed: removed.removedFile || removed.removedLines > 0, indexLines: removed.indexLines }
@@ -521,14 +521,49 @@ export function apply(ctx, config) {
   }
 
   /**
+   * The own index as projected from its entry files, bounded like a read
+   * index, with the file on disk repaired when it disagrees. The projection
+   * is what the model sees, so an index file left behind by an interrupted
+   * or overlapping write cannot hide an entry. A repair that fails is warned
+   * about once and changes nothing shown; an entry that cannot be read is
+   * warned about once and marks the index truncated, since it is missing a
+   * line. A projection that fails altogether (the directory or index file is
+   * unreadable) is `undefined`, and the section degrades to "not loaded".
+   * @param {string} indexPath - the own `MEMORY.md` path.
+   * @returns {Promise<{ text: string, truncated: boolean } | undefined>}
+   */
+  const currentOwnIndex = async (session, indexPath) => {
+    const dir = dirname(indexPath)
+    let index
+    try {
+      index = await projectIndex(dir)
+      if (index.stale) {
+        try {
+          await syncIndex(dir)
+        } catch (error) {
+          warnOnce(session, `${indexPath}#repair`, `claude-memory: cannot rewrite ${indexPath} from its entry files: ${error.message}; the projected index is shown anyway`)
+        }
+      }
+    } catch (error) {
+      warnOnce(session, indexPath, `claude-memory: cannot read ${indexPath}: ${error.message}`)
+      return undefined
+    }
+    if (index.skipped.length > 0) {
+      warnOnce(session, `${indexPath}#skipped`, `claude-memory: ${index.skipped.length} entry file(s) in ${dir} cannot be read (${index.skipped.map((entry) => `${entry.name}.md: ${entry.error.message}`).join('; ')}); the index shown omits them`)
+    }
+    const bounded = truncateIndex(index.text, limits)
+    return { text: bounded.text, truncated: bounded.truncated || index.skipped.length > 0 }
+  }
+
+  /**
    * Locate the stores this session reads and read their indexes. The Claude
    * Code index is located only when its switch is on; when it cannot be
    * inspected or read the whole result is `undefined`, so the turn enters
    * nothing rather than a message missing a section it could not vouch for.
    * The own store, when configured, is always named so the model can write
-   * to it; its index is read only when the `dsh` switch is on. An own index
-   * that cannot be read degrades to "not loaded" (the model is told to read
-   * it before saving); an own store that cannot be located or inspected
+   * to it; its index is projected from its entry files only when the `dsh`
+   * switch is on. An own index that cannot be projected degrades to "not
+   * loaded" (the model is told to read it before saving); an own store that cannot be located or inspected
    * marks the result `incomplete`, and the caller then enters nothing, since
    * a message without the own section would read as "not being read".
    * @param {Record<string, boolean>} read - resolved switches.
@@ -563,10 +598,10 @@ export function apply(ctx, config) {
         if (!toolsRegistered) warnOnce(session, 'tools', `claude-memory: the host registered no memory tools; session ${session.id} is told its own store cannot be written`)
         const unwritable = !toolsRegistered ? 'no-tools' : readOnly(session) ? 'read-only' : undefined
         stores.own = { path: own.path, truncated: false, loaded: read.dsh, ...(unwritable === undefined ? {} : { unwritable }) }
-        if (read.dsh && own.size !== undefined) {
-          const index = await currentIndex(session, own)
-          if (index.kind === 'error') stores.own.loaded = false
-          else if (index.kind === 'text') stores.own = { ...stores.own, text: index.text, truncated: index.truncated, loaded: true }
+        if (read.dsh) {
+          const index = await currentOwnIndex(session, own.path)
+          if (index === undefined) stores.own.loaded = false
+          else if (index.text.trim().length > 0 || index.truncated) stores.own = { ...stores.own, text: index.text, truncated: index.truncated, loaded: true }
         }
       }
     }

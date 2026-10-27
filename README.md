@@ -7,13 +7,13 @@ Gives a DeepSeek Harness session its project's persistent memory: the read-only 
 ## 它做什么
 
 - 每轮第一步按 Claude Code 的规则定位 `<claudeHome>/projects/<slug>/memory/MEMORY.md`,`<slug>` 是项目绝对路径把非字母数字字符换成 `-`。项目取 git 根;linked worktree 先试自身,再按 `commondir` 找主仓库(`--separate-git-dir` 时推不出);不在 git 里用工作目录。字面和真实路径各找一遍。
-- dsh 自己的记忆在 `<ownMemoryHome>/<slug>/`,`<slug>` 取规范根(主仓库 → git 根 → 工作目录,按真实路径),所有 worktree 共用;格式与 Claude Code 相同。模型用插件注册的 `memory_save` / `memory_delete` 工具写,服务端落盘、索引由条目重建(沙箱不放行 `~/.dsh`;read-only 会话和子代理被拒),下一轮重注;没有记忆时也注入目录和规则。细节见 [dsh 自己的记忆目录](.agents/notes/implemented/feature/2026-10-26-own-memory-store.md)。
-- 索引按 Claude Code 的上限截断:前 200 行或前 25,000 个 UTF-16 code unit(文档写 "25KB",anthropics/claude-code#97453 实测为 code unit),先到为准。截点回退到最后一个行尾;首行就超限时给该行不劈代理对的前缀。磁盘上最多只读 `3 × maxChars + 1` 字节。
+- dsh 自己的记忆在 `<ownMemoryHome>/<slug>/`,`<slug>` 取规范根(主仓库 → git 根 → 工作目录,按真实路径),所有 worktree 共用;格式与 Claude Code 相同。模型用插件注册的 `memory_save` / `memory_delete` 工具写,服务端落盘(沙箱不放行 `~/.dsh`;read-only 会话和子代理被拒);注入的索引每轮从条目文件算出,`MEMORY.md` 只是缓存;没有记忆时也注入目录和规则。细节见 [dsh 自己的记忆目录](.agents/notes/implemented/feature/2026-10-26-own-memory-store.md)。
+- 索引按 Claude Code 的上限截断:前 200 行或前 25,000 个 UTF-16 code unit(文档写 "25KB",anthropics/claude-code#97453 实测为 code unit),先到为准。截点回退到最后一个行尾;首行就超限时给不劈代理对的前缀。磁盘上最多只读 `3 × maxChars + 1` 字节。
 - 两个索引合成一条 `user` 角色、来源 `plugin:claude-memory`(form `snapshot`)的消息进入会话,紧跟本轮用户消息之后。它是普通的 `user/message` 会话事件,随日志重放、压缩、续聊;模型可见的内容都能从日志重建。
-- 会话投影 `claudeMemory` 记录最新一条仍在 surface 上的 snapshot 及其摘要,续聊时恢复,surface 替换在 `sourceEventSeqs` 里点名它时清空。摘要相同不注入;变了进新 snapshot,替代此前展示过的;两段都没得展示时进撤回 snapshot。size/mtime 没变就复用上次读取;读或 stat 失败只警告一次、不注入、绝不当作撤回。细节见 [snapshot 替代与撤回](.agents/notes/implemented/feature/2026-10-12-snapshot-replacement-and-withdrawal.md)。
-- 读哪些来源按会话选:`/memory claude|dsh on|off`(裸 `on|off` 全选,`status` 回显),或点模型选择旁的"记忆"菜单,每个来源一行各自开关;没切换过的取 `readByDefault`。关掉的来源不再加载,续聊保持,已注入的不删。写不受开关影响:`dsh` 读关着时仍给目录和规则,只不带索引内容。
+- 会话投影 `claudeMemory` 记录最新一条仍在 surface 上的 snapshot 及其摘要,续聊时恢复,surface 替换在 `sourceEventSeqs` 里点名它时清空。摘要相同不注入;变了进新 snapshot,替代此前展示过的;两段都没得展示时进撤回 snapshot。Claude Code 索引 size/mtime 没变就复用上次读取;读或 stat 失败只警告一次、不注入、绝不当作撤回。细节见 [snapshot 替代与撤回](.agents/notes/implemented/feature/2026-10-12-snapshot-replacement-and-withdrawal.md)。
+- 读哪些来源按会话选:`/memory claude|dsh on|off`(裸 `on|off` 全选,`status` 回显),或点模型选择旁的"记忆"菜单,每个来源一行各自开关;没切换过的取 `readByDefault`。关掉的来源不再加载,续聊保持,已注入的不删。写不受开关影响:`dsh` 读关着时仍给目录和规则,不带索引内容。
 - 条目文件不预加载,模型按需 `cat`;Claude Code 目录只读不改。
-- 子代理会话默认不注入(Claude Code 也如此);header 没有工作目录时不注入,绝不退回 dsh 进程的目录。
+- 子代理会话默认不注入(Claude Code 也如此);header 没有工作目录时不注入,不退回 dsh 进程的目录。
 
 ## 安装
 

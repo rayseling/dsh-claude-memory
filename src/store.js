@@ -1,33 +1,45 @@
 /**
- * Pure helpers that write the harness's own memory store: one memory file
- * per fact, in the format Claude Code uses for its auto memory, and the
+ * Pure helpers for the harness's own memory store: one memory file per
+ * fact, in the format Claude Code uses for its auto memory, and the
  * `MEMORY.md` index as a projection of those files. Nothing here touches the
  * harness; `node --test` covers it with temporary directories. The plugin
- * exposes these through the `memory_save` and `memory_delete` tools because
- * the file sandbox denies the model's own file tools outside the workspace.
+ * exposes the writers through the `memory_save` and `memory_delete` tools
+ * because the file sandbox denies the model's own file tools outside the
+ * workspace.
  *
- * The index is never read-modify-written. A save writes its own entry file
- * (atomically, by rename), then rebuilds the index from every entry file in
- * the directory, then lists the directory again and rebuilds once more if it
- * changed meanwhile. Two writers in different processes can therefore never
- * lose each other's line: whichever index write lands last was computed from
- * a listing taken after every entry written before it, and a writer whose
- * entry appeared later rebuilds again. No lock file is involved, so there is
- * no ownership to lose on an abandoned lock either. The price is that an
- * index line edited by hand is replaced by the entry's own `title` and `hook`
- * on the next write; the entry file is the place to edit.
+ * The entry files are the only source of truth. {@link projectIndex} derives
+ * the index text from them, and both the reader (the plugin's first step)
+ * and the writers go through it: a save or delete writes its own entry file
+ * atomically and then rewrites `MEMORY.md` from a fresh listing; a read
+ * derives the text the same way and rewrites the file when it disagrees.
+ * The file on disk is therefore a cache that may lag behind the entries
+ * while writers overlap, and what the model sees never does. No lock file is
+ * involved and nothing is read-modify-written. The price is that an index
+ * line edited by hand is replaced by the entry's own `title` and `hook`; the
+ * entry file is the place to edit. An entry written by hand (no `title` or
+ * `hook`) keeps the index line it already has, else indexes under its name
+ * and description.
  * @module dsh-claude-memory/store
  */
 
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isAbsence } from './locate.js'
 
 /** Memory types Claude Code distinguishes; the tool enum and the frontmatter value. */
 export const MEMORY_TYPES = Object.freeze(['user', 'feedback', 'project', 'reference'])
 
-/** File-name grammar: lower-case kebab-case, the way Claude Code names its memories. */
+/** Grammar of a name the save tool accepts: lower-case kebab-case, the way Claude Code names its memories. */
 const NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+
+/**
+ * Grammar of a file stem the index lists: one path segment of letters,
+ * digits, dots, hyphens and underscores, so a file copied from Claude Code
+ * (`feedback_testing.md`) indexes too. No leading dot, so `.` and `..` and
+ * temporary files are out; no bracket or parenthesis, so the stem cannot
+ * break its own index link.
+ */
+const ENTRY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 /**
  * Stems a memory may not take: `memory` is `MEMORY.md` on a case-insensitive
@@ -38,18 +50,18 @@ const RESERVED_NAMES = new Set(['memory'])
 
 /**
  * @param {string} name - candidate memory name.
- * @returns {boolean} whether it is a valid, unreserved file stem.
+ * @returns {boolean} whether the save tool may create it: a valid, unreserved kebab-case stem.
  */
 export function isMemoryName(name) {
   return typeof name === 'string' && name.length <= 100 && NAME_PATTERN.test(name) && !RESERVED_NAMES.has(name.toLowerCase())
 }
 
 /**
- * @param {string} name
- * @throws {TypeError} when the name is not a valid, unreserved stem; the store never touches the disk for such a name.
+ * @param {string} name - candidate file stem.
+ * @returns {boolean} whether a file of that stem is an entry of the store, and so may be listed or deleted.
  */
-function assertMemoryName(name) {
-  if (!isMemoryName(name)) throw new TypeError(`not a memory name: ${JSON.stringify(name)}`)
+export function isEntryName(name) {
+  return typeof name === 'string' && name.length <= 100 && ENTRY_PATTERN.test(name) && !RESERVED_NAMES.has(name.toLowerCase())
 }
 
 /**
@@ -58,7 +70,7 @@ function assertMemoryName(name) {
  * @returns {string}
  */
 function oneLine(text) {
-  return text.replace(/\s*(?:\r\n|\r|\n)\s*/g, ' ').trim()
+  return text.replace(/\s*(?:\r\n|\r|\n|\u2028|\u2029)\s*/g, ' ').trim()
 }
 
 /**
@@ -97,30 +109,51 @@ export function renderMemoryFile({ name, description, title, hook, type, content
 }
 
 /**
- * The top-level scalar fields of a file's leading YAML frontmatter block.
- * Only the subset this store writes is understood: `key: value` lines, with
- * a JSON-quoted or bare value; nested blocks are skipped.
+ * The value of a YAML flow scalar as this store reads it: double-quoted
+ * (JSON escapes), single-quoted (`''` for a quote), or bare with a trailing
+ * ` # comment` dropped. A quoted scalar that does not parse is kept as text.
+ * @param {string} raw - the text after `key:`, trimmed.
+ * @returns {string}
+ */
+function flowScalar(raw) {
+  if (raw.startsWith('"')) {
+    try {
+      return String(JSON.parse(raw))
+    } catch {
+      return raw
+    }
+  }
+  if (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) return raw.slice(1, -1).replace(/''/g, "'")
+  return raw.replace(/\s+#.*$/, '').trim()
+}
+
+/**
+ * The top-level fields of a file's leading YAML frontmatter block. Only the
+ * subset a memory file uses is understood: `key: value` at column zero with
+ * a double-quoted, single-quoted or bare value, or a block scalar (`|`, `>`,
+ * with `-` or `+`) whose indented lines are joined into one value; a nested
+ * mapping such as `metadata:` is skipped. A byte order mark is ignored.
  * @param {string} text - file text.
  * @returns {Record<string, string>} the fields found, possibly none.
  */
 export function parseFrontmatter(text) {
   const fields = {}
-  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)
+  const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text)
   if (match === null) return fields
-  for (const line of match[1].split(/\r?\n/)) {
-    const pair = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line)
+  const lines = match[1].split(/\r?\n/)
+  for (let at = 0; at < lines.length; at += 1) {
+    const pair = /^([A-Za-z_][\w-]*):(?:\s+(.*))?$/.exec(lines[at])
     if (pair === null) continue
-    const raw = pair[2].trim()
+    const raw = (pair[2] ?? '').trim()
     if (raw.length === 0) continue
-    let value = raw
-    if (raw.startsWith('"')) {
-      try {
-        value = JSON.parse(raw)
-      } catch {
-        value = raw
+    if (/^[|>][+-]?$/.test(raw)) {
+      const block = []
+      while (at + 1 < lines.length && (lines[at + 1].trim().length === 0 || /^\s/.test(lines[at + 1]))) {
+        at += 1
+        block.push(lines[at].trim())
       }
-    }
-    fields[pair[1]] = String(value)
+      fields[pair[1]] = block.join(raw.startsWith('|') ? '\n' : ' ').trim()
+    } else fields[pair[1]] = flowScalar(raw)
   }
   return fields
 }
@@ -158,17 +191,26 @@ export function indexLineName(line) {
 }
 
 /**
+ * The index lines of a text by the name each is the entry for, first line per name, in order.
+ * @param {string} text
+ * @returns {Map<string, string>}
+ */
+function indexLines(text) {
+  const lines = new Map()
+  for (const line of text.split(/\r?\n/)) {
+    const name = indexLineName(line)
+    if (name !== undefined && !lines.has(name)) lines.set(name, line)
+  }
+  return lines
+}
+
+/**
  * The names an index text lists, in order, each once.
  * @param {string} text
  * @returns {string[]}
  */
 export function indexOrder(text) {
-  const names = []
-  for (const line of text.split(/\r?\n/)) {
-    const name = indexLineName(line)
-    if (name !== undefined && !names.includes(name)) names.push(name)
-  }
-  return names
+  return [...indexLines(text).keys()]
 }
 
 /**
@@ -202,55 +244,76 @@ async function writeAtomic(path, text) {
 }
 
 /**
- * Every memory entry in a directory: each `<name>.md` with a valid name,
- * read for its index fields. An entry that vanishes between the listing and
- * the read (a concurrent delete) is skipped. A file without `title` or `hook`
- * (written by hand, or copied from Claude Code) indexes under its name and
- * description.
+ * @param {string | undefined} value
+ * @returns {string | undefined} the value unless it is empty.
+ */
+const nonEmpty = (value) => (value !== undefined && value.trim().length > 0 ? value : undefined)
+
+/**
+ * Every memory entry in a directory: each regular file `<name>.md` with an
+ * entry name (symbolic links are not followed), read for its index fields.
+ * An entry that vanishes between the listing and the read (a concurrent
+ * delete) is simply absent; one that cannot be read for another reason is
+ * reported in `skipped` and the rest still list. A file without `title` or
+ * `hook` (written by hand, or copied from Claude Code) is marked `indexed:
+ * false` and indexes under its name and description.
  * @param {string} dir
- * @returns {Promise<{ name: string, title: string, hook: string, mtimeMs: number }[]>} sorted by name.
+ * @returns {Promise<{ entries: { name: string, title: string, hook: string, mtimeMs: number, indexed: boolean }[], skipped: { name: string, error: Error }[] }>}
+ *   entries sorted by name; an absent directory has none.
  */
 export async function listEntries(dir) {
   let names
   try {
     names = await readdir(dir)
   } catch (error) {
-    if (isAbsence(error)) return []
+    if (isAbsence(error)) return { entries: [], skipped: [] }
     throw error
   }
   const entries = []
+  const skipped = []
   for (const file of names) {
     if (!file.endsWith('.md')) continue
     const name = file.slice(0, -3)
-    if (!isMemoryName(name)) continue
+    if (!isEntryName(name)) continue
     const path = join(dir, file)
     let text
     let info
     try {
-      info = await stat(path)
+      info = await lstat(path)
       if (!info.isFile()) continue
       text = await readFile(path, 'utf8')
     } catch (error) {
-      if (isAbsence(error)) continue
-      throw error
+      if (!isAbsence(error)) skipped.push({ name, error })
+      continue
     }
     const fields = parseFrontmatter(text)
-    entries.push({ name, title: fields.title ?? fields.name ?? name, hook: fields.hook ?? fields.description ?? '', mtimeMs: info.mtimeMs })
+    const indexed = nonEmpty(fields.title) !== undefined || nonEmpty(fields.hook) !== undefined
+    entries.push({
+      name,
+      title: nonEmpty(fields.title) ?? nonEmpty(fields.name) ?? name,
+      hook: nonEmpty(fields.hook) ?? nonEmpty(fields.description) ?? '',
+      mtimeMs: info.mtimeMs,
+      indexed,
+    })
   }
-  return entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+  return { entries: entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0), skipped }
 }
 
 /**
- * The index text for a set of entries: names already in the previous index
- * keep their order, newer entries follow in the order they were written.
- * @param {{ name: string, title: string, hook: string, mtimeMs: number }[]} entries
- * @param {string} previous - the previous index text, for ordering only.
+ * The index text for a set of entries. Names already in the previous index
+ * keep their order, newer entries follow in the order they were written. An
+ * entry that carries its own index fields renders from them; one that does
+ * not keeps the line the previous index had for it.
+ * @param {{ name: string, title: string, hook: string, mtimeMs: number, indexed?: boolean }[]} entries
+ * @param {string} previous - the previous index text.
  * @returns {string} the index text, newline-terminated, or '' for no entries.
  */
 export function renderIndex(entries, previous) {
   const byName = new Map(entries.map((entry) => [entry.name, entry]))
+  const kept = indexLines(previous)
+  const line = (entry) => (entry.indexed === false && kept.has(entry.name) ? kept.get(entry.name).trimEnd() : renderIndexLine(entry))
   const ordered = []
-  for (const name of indexOrder(previous)) {
+  for (const name of kept.keys()) {
     const entry = byName.get(name)
     if (entry !== undefined) {
       ordered.push(entry)
@@ -258,39 +321,43 @@ export function renderIndex(entries, previous) {
     }
   }
   const fresh = [...byName.values()].sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : 1))
-  const lines = [...ordered, ...fresh].map(renderIndexLine)
+  const lines = [...ordered, ...fresh].map(line)
   return lines.length === 0 ? '' : `${lines.join('\n')}\n`
 }
 
 /**
- * @param {{ name: string, mtimeMs: number }[]} entries
- * @returns {string} a fingerprint of which entries exist and when they were written.
+ * @param {string} text - index text.
+ * @returns {{ indexLines: number, indexChars: number }} line and UTF-16 code unit counts without the final newline, as the reader counts.
  */
-const fingerprint = (entries) => entries.map((entry) => `${entry.name}@${entry.mtimeMs}`).join('|')
-
-/** How many times a writer rebuilds the index after seeing the directory change under it. */
-const REBUILD_ROUNDS = 8
+function measure(text) {
+  const body = text.replace(/(?:\r?\n)+$/, '')
+  return { indexLines: body.length === 0 ? 0 : body.split('\n').length, indexChars: body.length }
+}
 
 /**
- * Rebuild `<dir>/MEMORY.md` from the entry files until a rebuild sees the
- * same directory it was built from. The loop ends after a bounded number of
- * rounds; the last write is still built from a complete listing.
+ * Derive the index of a directory from its entry files, without writing.
+ * This is what the model is shown; the file on disk is only its cache.
  * @param {string} dir
- * @returns {Promise<{ indexPath: string, text: string, indexLines: number, indexChars: number }>}
+ * @returns {Promise<{ indexPath: string, text: string, stale: boolean, skipped: { name: string, error: Error }[], indexLines: number, indexChars: number }>}
+ *   the index text, whether the file on disk differs from it, and the entries that could not be read and so are missing from it.
+ */
+export async function projectIndex(dir) {
+  const indexPath = join(dir, 'MEMORY.md')
+  const [{ entries, skipped }, previous] = await Promise.all([listEntries(dir), readOrEmpty(indexPath)])
+  const text = renderIndex(entries, previous)
+  return { indexPath, text, stale: text !== previous, skipped, ...measure(text) }
+}
+
+/**
+ * Project the index and rewrite `<dir>/MEMORY.md` when it differs. Not
+ * serialized: callers hold the directory's turn.
+ * @param {string} dir
+ * @returns {Promise<Awaited<ReturnType<typeof projectIndex>> & { written: boolean }>}
  */
 async function rebuildIndex(dir) {
-  const indexPath = join(dir, 'MEMORY.md')
-  let entries = await listEntries(dir)
-  let text = ''
-  for (let round = 0; round < REBUILD_ROUNDS; round += 1) {
-    text = renderIndex(entries, await readOrEmpty(indexPath))
-    await writeAtomic(indexPath, text)
-    const again = await listEntries(dir)
-    if (fingerprint(again) === fingerprint(entries)) break
-    entries = again
-  }
-  const body = text.replace(/(?:\r?\n)+$/, '')
-  return { indexPath, text, indexLines: body.length === 0 ? 0 : body.split('\n').length, indexChars: body.length }
+  const index = await projectIndex(dir)
+  if (index.stale) await writeAtomic(index.indexPath, index.text)
+  return { ...index, written: index.stale }
 }
 
 /** Pending write per directory, so two sessions of one process rebuild in turn rather than in parallel. */
@@ -311,16 +378,27 @@ function serialized(dir, task) {
 }
 
 /**
- * Create or replace one memory and rebuild the index.
+ * Bring `<dir>/MEMORY.md` up to date with the entry files: the repair a
+ * reader runs when the projection disagrees with the file. An absent
+ * directory stays absent.
+ * @param {string} dir
+ * @returns {Promise<Awaited<ReturnType<typeof rebuildIndex>>>}
+ */
+export function syncIndex(dir) {
+  return serialized(dir, () => rebuildIndex(dir))
+}
+
+/**
+ * Create or replace one memory and rewrite the index from the entry files.
  * @param {string} dir - the project's own memory directory, created when missing.
  * @param {{ name: string, description: string, type: string, title: string, hook: string, content: string, sessionId: string, modified?: Date }} memory
  * @returns {Promise<{ path: string, indexPath: string, created: boolean, indexLines: number, indexChars: number }>} where the file
- *   went, whether it is new, and the index's line and UTF-16 code unit counts (without the final newline, as the reader
- *   counts) after the write, which the caller measures against the read caps the way Claude Code does after every index write.
- * @throws {TypeError} for a name that is not a valid, unreserved stem; nothing is written.
+ *   went, whether it is new, and the index's line and UTF-16 code unit counts after the write, which the caller measures
+ *   against the read caps the way Claude Code does after every index write.
+ * @throws {TypeError} for a name the save tool does not accept; nothing is written.
  */
 export async function saveMemory(dir, memory) {
-  assertMemoryName(memory.name)
+  if (!isMemoryName(memory.name)) throw new TypeError(`not a memory name: ${JSON.stringify(memory.name)}`)
   await mkdir(dir, { recursive: true })
   return serialized(dir, async () => {
     const path = join(dir, `${memory.name}.md`)
@@ -352,15 +430,16 @@ export function judgeIndex({ indexLines, indexChars }, { maxLines, maxChars }) {
 }
 
 /**
- * Remove one memory and rebuild the index. A memory that is already gone is
- * not an error: the end state is what the caller asked for.
+ * Remove one memory and rewrite the index from the entry files. A memory
+ * that is already gone is not an error: the end state is what the caller
+ * asked for.
  * @param {string} dir - the project's own memory directory.
- * @param {string} name - memory name.
+ * @param {string} name - entry name, as the index lists it.
  * @returns {Promise<{ path: string, indexPath: string, removedFile: boolean, removedLines: number, indexLines: number }>}
- * @throws {TypeError} for a name that is not a valid, unreserved stem; nothing is removed.
+ * @throws {TypeError} for a name that is not an entry name; nothing is removed.
  */
 export async function deleteMemory(dir, name) {
-  assertMemoryName(name)
+  if (!isEntryName(name)) throw new TypeError(`not an entry name: ${JSON.stringify(name)}`)
   const path = join(dir, `${name}.md`)
   const indexPath = join(dir, 'MEMORY.md')
   // A project without a store has nothing to delete, and gets no directory for asking.
