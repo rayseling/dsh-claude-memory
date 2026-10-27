@@ -9,7 +9,8 @@
  * @module dsh-claude-memory/store
  */
 
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isAbsence } from './locate.js'
 
@@ -126,7 +127,7 @@ function pointsAt(line, name) {
  * @returns {{ text: string, replaced: boolean, lines: number }} the new text, whether a line was replaced, and the line count.
  */
 export function upsertIndexLine(index, name, line) {
-  const lines = index.length === 0 ? [] : index.replace(/\n$/, '').split('\n')
+  const lines = index.length === 0 ? [] : index.replace(/(?:\r?\n)+$/, '').split('\n')
   const at = lines.findIndex((existing) => pointsAt(existing, name))
   const kept = at === -1 ? [...lines, line] : lines.filter((existing, position) => position === at || !pointsAt(existing, name))
   if (at !== -1) kept[at] = line
@@ -140,7 +141,7 @@ export function upsertIndexLine(index, name, line) {
  * @returns {{ text: string, removed: number, lines: number }} the new text, how many lines went, and the line count.
  */
 export function removeIndexLine(index, name) {
-  const lines = index.length === 0 ? [] : index.replace(/\n$/, '').split('\n')
+  const lines = index.length === 0 ? [] : index.replace(/(?:\r?\n)+$/, '').split('\n')
   const kept = lines.filter((existing) => !pointsAt(existing, name))
   return { text: kept.length === 0 ? '' : `${kept.join('\n')}\n`, removed: lines.length - kept.length, lines: kept.length }
 }
@@ -173,47 +174,134 @@ async function writeAtomic(path, text) {
 /** Pending write per directory, so two sessions of one process update the index in turn. */
 const queues = new Map()
 
-/** How long a lock file may sit before it is presumed abandoned by a dead process. */
-const LOCK_STALE_MS = 10_000
+/** Lock timing: a lock whose heartbeat stopped this long ago is presumed abandoned; a writer waits this long before giving up. */
+export const LOCK_TIMING = Object.freeze({ staleMs: 10_000, waitMs: 10_000 })
 
-/** How long a writer waits for the lock before giving up. */
-const LOCK_WAIT_MS = 10_000
+/**
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Create `path` exclusively with `content`, closing the handle whatever happens.
+ * @param {string} path
+ * @param {string} content
+ * @returns {Promise<boolean>} false when the path already exists.
+ */
+async function createExclusive(path, content) {
+  let handle
+  try {
+    handle = await open(path, 'wx')
+  } catch (error) {
+    if (error?.code === 'EEXIST') return false
+    throw error
+  }
+  try {
+    await handle.writeFile(content)
+  } finally {
+    await handle.close()
+  }
+  return true
+}
+
+/**
+ * Remove `path` only while it still carries `token`, so a release never
+ * removes a lock another writer took over in the meantime.
+ * @param {string} path
+ * @param {string} token
+ */
+async function removeIfOwned(path, token) {
+  let owner
+  try {
+    owner = await readFile(path, 'utf8')
+  } catch (error) {
+    if (isAbsence(error)) return
+    throw error
+  }
+  if (owner === token) await rm(path, { force: true })
+}
+
+/**
+ * Take over `lockPath` if it is abandoned. Takeover is serialized through a
+ * second exclusive file, `<lock>.takeover`, so two waiters cannot both decide
+ * the same lock is stale: under that mutex the lock is inspected again, and
+ * only a file that is still the same inode and still past `staleMs` is
+ * renamed away and removed. A takeover file itself older than `staleMs` is
+ * the trace of a writer that died inside this function and is removed.
+ * @param {string} lockPath
+ * @param {number} staleMs
+ * @returns {Promise<void>} resolves once the stale lock is gone, or at once when it was not stale or someone else is handling it.
+ */
+async function takeOverIfStale(lockPath, staleMs) {
+  let before
+  try {
+    before = await stat(lockPath)
+  } catch (error) {
+    if (isAbsence(error)) return
+    throw error
+  }
+  if (Date.now() - before.mtimeMs <= staleMs) return
+  const mutex = `${lockPath}.takeover`
+  if (!await createExclusive(mutex, `${process.pid}\n`)) {
+    const info = await stat(mutex).catch(() => undefined)
+    if (info !== undefined && Date.now() - info.mtimeMs > staleMs) await rm(mutex, { force: true })
+    return
+  }
+  try {
+    let again
+    try {
+      again = await stat(lockPath)
+    } catch (error) {
+      if (isAbsence(error)) return
+      throw error
+    }
+    if (again.ino !== before.ino || Date.now() - again.mtimeMs <= staleMs) return
+    const graveyard = `${lockPath}.stale.${process.pid}.${Date.now()}`
+    try {
+      await rename(lockPath, graveyard)
+    } catch (error) {
+      if (isAbsence(error)) return
+      throw error
+    }
+    await rm(graveyard, { force: true })
+  } finally {
+    await rm(mutex, { force: true })
+  }
+}
 
 /**
  * Hold `<dir>/.MEMORY.lock` while `task` runs, so writers in other processes
  * (a web and a headless session of one project) read and rewrite the index in
- * turn. The lock is an exclusively created file; a lock older than
- * {@link LOCK_STALE_MS} is removed as abandoned.
+ * turn. The lock is an exclusively created file carrying the holder's token;
+ * the holder touches it every quarter of `staleMs` while the task runs, so a
+ * long write is not mistaken for an abandoned one, and releases it only while
+ * it still carries its token. An abandoned lock is taken over through
+ * {@link takeOverIfStale}.
  * @template T
- * @param {string} dir
+ * @param {string} dir - the memory directory, which must exist.
  * @param {() => Promise<T>} task
+ * @param {{ staleMs?: number, waitMs?: number }} [timing] - overrides for tests; production uses {@link LOCK_TIMING}.
  * @returns {Promise<T>}
+ * @throws {Error} when the lock stays held by a live writer past `waitMs`.
  */
-async function locked(dir, task) {
+export async function withStoreLock(dir, task, { staleMs = LOCK_TIMING.staleMs, waitMs = LOCK_TIMING.waitMs } = {}) {
   const lockPath = join(dir, '.MEMORY.lock')
-  const deadline = Date.now() + LOCK_WAIT_MS
-  for (;;) {
-    let handle
-    try {
-      handle = await open(lockPath, 'wx')
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error
-      const info = await stat(lockPath).catch(() => undefined)
-      if (info !== undefined && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-        await rm(lockPath, { force: true })
-        continue
-      }
-      if (Date.now() > deadline) throw new Error(`memory store ${dir} is locked by another writer (${lockPath}); try again`)
-      await new Promise((resolve) => setTimeout(resolve, 15 + Math.random() * 20))
-      continue
-    }
-    try {
-      await handle.writeFile(`${process.pid}\n`)
-      await handle.close()
-      return await task()
-    } finally {
-      await rm(lockPath, { force: true })
-    }
+  const token = `${process.pid}:${randomUUID()}\n`
+  const deadline = Date.now() + waitMs
+  while (!await createExclusive(lockPath, token)) {
+    await takeOverIfStale(lockPath, staleMs)
+    if (Date.now() > deadline) throw new Error(`memory store ${dir} is locked by another writer (${lockPath}); try again`)
+    await sleep(10 + Math.random() * 20)
+  }
+  const now = () => new Date()
+  const heartbeat = setInterval(() => { utimes(lockPath, now(), now()).catch(() => {}) }, Math.max(1, Math.floor(staleMs / 4)))
+  heartbeat.unref?.()
+  try {
+    return await task()
+  } finally {
+    clearInterval(heartbeat)
+    await removeIfOwned(lockPath, token)
   }
 }
 
@@ -227,7 +315,7 @@ async function locked(dir, task) {
  */
 function serialized(dir, task) {
   const previous = queues.get(dir) ?? Promise.resolve()
-  const run = previous.then(() => locked(dir, task), () => locked(dir, task))
+  const run = previous.then(() => withStoreLock(dir, task), () => withStoreLock(dir, task))
   queues.set(dir, run.catch(() => {}))
   return run
 }
@@ -251,7 +339,7 @@ export async function saveMemory(dir, memory) {
     await writeAtomic(path, renderMemoryFile({ ...memory, modified: memory.modified ?? new Date() }))
     const index = upsertIndexLine(await readOrEmpty(indexPath), memory.name, renderIndexLine(memory))
     await writeAtomic(indexPath, index.text)
-    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.replace(/\n$/, '').length }
+    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.replace(/(?:\r?\n)+$/, '').length }
   })
 }
 
@@ -279,10 +367,16 @@ export function judgeIndex({ indexLines, indexChars }, { maxLines, maxChars }) {
  */
 export async function deleteMemory(dir, name) {
   assertMemoryName(name)
-  await mkdir(dir, { recursive: true })
+  const path = join(dir, `${name}.md`)
+  const indexPath = join(dir, 'MEMORY.md')
+  // A project without a store has nothing to delete, and gets no directory for asking.
+  try {
+    await stat(dir)
+  } catch (error) {
+    if (!isAbsence(error)) throw error
+    return { path, indexPath, removedFile: false, removedLines: 0, indexLines: 0 }
+  }
   return serialized(dir, async () => {
-    const path = join(dir, `${name}.md`)
-    const indexPath = join(dir, 'MEMORY.md')
     let removedFile = true
     try {
       await rm(path)

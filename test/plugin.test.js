@@ -57,6 +57,7 @@ function mount(config = {}, { withCommands = false, commandError = undefined, wi
   const states = new WeakMap()
   const commands = []
   const tools = []
+  const toolEffects = []
   const ctx = {
     logger: { info: (line) => logs.push(['info', line]), warn: (line) => logs.push(['warn', line]) },
     on(event, handler) {
@@ -73,6 +74,8 @@ function mount(config = {}, { withCommands = false, commandError = undefined, wi
       if (deps.includes('tools')) {
         if (withTools) {
           callback({
+            // Cordis runs an effect's disposer when the scope unloads; `disposeTools` stands in for that.
+            effect(execute) { toolEffects.push(execute()); return () => {} },
             tools: {
               register(definition) {
                 if (toolError !== undefined && definition.name === toolError) throw new Error(`duplicate tool ${definition.name}`)
@@ -130,7 +133,8 @@ function mount(config = {}, { withCommands = false, commandError = undefined, wi
       states.get(session).set(key, unit.apply(prior, event))
     }
   }
-  return { listener, logs, commit, definition, modeDefinition, commands, tools, ctx }
+  const disposeTools = () => { for (const dispose of toolEffects.splice(0)) dispose() }
+  return { listener, logs, commit, definition, modeDefinition, commands, tools, disposeTools, ctx }
 }
 
 const userMessage = (text) => ({ id: `u-${text}`, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } })
@@ -317,7 +321,7 @@ test('the write tools refuse subagents without includeSubagents and read-only se
   assert.equal((await sharedSave.execute(args, exec({ cwd: project, origin: 'subagent' }))).created, true)
 })
 
-test('an own store that cannot be located enters nothing this turn, even when the Claude Code index could', async () => {
+test('an own store that cannot be inspected enters nothing this turn, even when the Claude Code index could', async () => {
   const { ownHome, project } = seedOwn()
   const { home } = seedProject()
   const claudeDir = join(home, 'projects', slugOf(project), 'memory')
@@ -331,21 +335,36 @@ test('an own store that cannot be located enters nothing this turn, even when th
   commitAll(commit, agent.session, first, 1)
   writeFileSync(join(claudeDir, 'MEMORY.md'), '- claude line changed\n')
   utimesSync(join(claudeDir, 'MEMORY.md'), new Date(Date.now() + 5000), new Date(Date.now() + 5000))
-  // A `.git` file that cannot be read makes canonicalRoot throw, so the own store cannot be located.
-  const { chmodSync, readFileSync } = await import('node:fs')
-  writeFileSync(join(project, '.git'), 'gitdir: /nowhere\n')
-  chmodSync(join(project, '.git'), 0o000)
-  let readable = true
-  try { readFileSync(join(project, '.git')) } catch { readable = false }
+  // Only the own store's directory becomes uninspectable; the Claude Code index stays readable and has changed.
+  const { chmodSync, statSync } = await import('node:fs')
+  const ownDir = join(ownHome, slugOf(project))
+  chmodSync(ownDir, 0o000)
+  let inspectable = true
+  try { statSync(join(ownDir, 'MEMORY.md')) } catch { inspectable = false }
   try {
-    if (!readable) {
+    if (!inspectable) {
       const next = await run(listener, { agent })
       assert.equal(next.messages.length, 1, 'a changed Claude index would enter a message without the own section: nothing entered, no withdrawal')
-      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('cannot inspect')))
+      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('cannot inspect the own memory index')))
     }
   } finally {
-    chmodSync(join(project, '.git'), 0o644)
+    chmodSync(ownDir, 0o755)
   }
+})
+
+test('unloading the tool scope makes the next message say the store cannot be written', async () => {
+  const { ownHome, project } = seedOwn()
+  const { listener, tools, disposeTools, commit } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.ok(first.messages[1].content[0].text.includes('memory_save'))
+  commitAll(commit, agent.session, first, 1)
+  assert.equal(tools.length, 2)
+  disposeTools()
+  const after = await run(listener, { agent })
+  assert.equal(after.messages.length, 2, 'the framing changed, so a new snapshot enters')
+  assert.ok(after.messages[1].content[0].text.includes('This host offers no memory tools'))
+  assert.ok(!after.messages[1].content[0].text.includes('memory_save'))
 })
 
 test('parses the /memory argument grammar', () => {

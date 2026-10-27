@@ -345,10 +345,11 @@ export function apply(ctx, config) {
         return ownMemoryDir(cwd, ownMemoryHome)
       }
       const disposers = []
-      // Both tools or neither: a half-registered pair would leave the framing wrong either way.
-      toolCtx.on?.('dispose', () => {
+      // The framing names the tools only while this scope, and so the tool
+      // registry, is alive: the effect's disposer runs when the scope unloads.
+      toolCtx.effect(() => () => {
         toolsRegistered = false
-      })
+      }, 'claude-memory: memory tools')
       /**
        * Claude Code measures the index after every write: near a cap it
        * reminds the model to shorten it; over a cap the write stands but the
@@ -525,13 +526,13 @@ export function apply(ctx, config) {
    * inspected or read the whole result is `undefined`, so the turn enters
    * nothing rather than a message missing a section it could not vouch for.
    * The own store, when configured, is always named so the model can write
-   * to it; its index is read only when the `dsh` switch is on, and an index
-   * that cannot be inspected or read degrades to "not loaded" (the model is
-   * told to read it before saving) so the Claude Code section still enters.
-   * The result also says whether a store that should have been shown could
-   * not be inspected, so the caller never mistakes that for "nothing to show".
+   * to it; its index is read only when the `dsh` switch is on. An own index
+   * that cannot be read degrades to "not loaded" (the model is told to read
+   * it before saving); an own store that cannot be located or inspected
+   * marks the result `incomplete`, and the caller then enters nothing, since
+   * a message without the own section would read as "not being read".
    * @param {Record<string, boolean>} read - resolved switches.
-   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean, writable: boolean }, incomplete: boolean } | undefined>}
+   * @returns {Promise<{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded: boolean, unwritable?: 'no-tools' | 'read-only' }, incomplete: boolean } | undefined>}
    */
   const currentStores = async (session, cwd, signal, read) => {
     let located

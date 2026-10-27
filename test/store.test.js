@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -9,7 +9,7 @@ import ToolRuntime from '@deepseek-ai/dsh-tools'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import {
-  MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, removeIndexLine, renderIndexLine, renderMemoryFile, saveMemory, upsertIndexLine,
+  MEMORY_TYPES, deleteMemory, isMemoryName, judgeIndex, removeIndexLine, renderIndexLine, renderMemoryFile, saveMemory, upsertIndexLine, withStoreLock,
 } from '../src/store.js'
 import { Config, DELETE_TOOL_NAME, SAVE_TOOL_NAME, apply } from '../src/index.js'
 import { slugOf } from '../src/locate.js'
@@ -63,6 +63,7 @@ test('index lines are upserted by link target and removed by it, keeping the res
   const appended = upsertIndexLine('- [Other](other.md) — o', 'deploy-host', line)
   assert.equal(appended.text, `- [Other](other.md) — o\n${line}\n`, 'a file without a trailing newline still gets one line per entry')
   assert.equal(renderIndexLine({ name: 'cr', title: 'a\rb', hook: 'x\r\ny\rz' }), '- [a b](cr.md) — x y z', 'bare carriage returns fold like newlines')
+  assert.deepEqual(upsertIndexLine('- [A](a.md) — a\n\n\n', 'b', '- [B](b.md) — b'), { text: '- [A](a.md) — a\n- [B](b.md) — b\n', replaced: false, lines: 2 }, 'trailing blank lines are dropped, as the reader drops them')
   const handEdited = '  * [Alpha](alpha.md) — indented star\n- [Alpha](alpha.md) — duplicate\n+ [Beta](beta.md) — plus\n'
   assert.deepEqual(upsertIndexLine(handEdited, 'alpha', '- [Alpha](alpha.md) — new'), { text: '- [Alpha](alpha.md) — new\n+ [Beta](beta.md) — plus\n', replaced: true, lines: 2 }, 'any list marker and indentation count, and duplicates collapse')
   assert.deepEqual(removeIndexLine(handEdited, 'alpha'), { text: '+ [Beta](beta.md) — plus\n', removed: 2, lines: 1 })
@@ -97,6 +98,9 @@ test('saveMemory creates the directory, the file, and the index line; a second s
   assert.equal(readFileSync(join(dir, 'MEMORY.md'), 'utf8'), '- [Other](other.md) — o\n')
   const again = await deleteMemory(dir, 'deploy-host')
   assert.deepEqual(again, { path: first.path, indexPath: join(dir, 'MEMORY.md'), removedFile: false, removedLines: 0, indexLines: 1 }, 'deleting a missing memory is not an error')
+  const nowhere = join(scratch(), 'never-created')
+  assert.equal((await deleteMemory(nowhere, 'x')).removedFile, false)
+  assert.equal(existsSync(nowhere), false, 'a delete does not create a store')
 })
 
 test('concurrent saves to one directory all land in the index', async () => {
@@ -139,6 +143,79 @@ test('a stale lock left by a dead process is taken over', async () => {
   const saved = await saveMemory(dir, { name: 'after-crash', description: 'd', type: 'project', title: 't', hook: 'h', content: 'c', sessionId: 's' })
   assert.equal(saved.created, true)
   assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
+  assert.deepEqual(readdirSync(dir).filter((entry) => entry.startsWith('.MEMORY')), [], 'no takeover or graveyard file is left behind')
+})
+
+/** Run `count` critical sections through `withStoreLock` and record whether any two overlapped. */
+async function contend(dir, count, timing, hold = 15) {
+  let active = 0
+  let overlaps = 0
+  let runs = 0
+  await Promise.all(Array.from({ length: count }, () => withStoreLock(dir, async () => {
+    active += 1
+    if (active > 1) overlaps += 1
+    await new Promise((resolve) => setTimeout(resolve, hold))
+    active -= 1
+    runs += 1
+  }, timing)))
+  return { overlaps, runs }
+}
+
+test('two waiters that both find the same abandoned lock never both take it over', async () => {
+  const dir = join(scratch(), 'store')
+  mkdirSync(dir, { recursive: true })
+  const { utimesSync } = await import('node:fs')
+  for (let round = 0; round < 10; round += 1) {
+    writeFileSync(join(dir, '.MEMORY.lock'), 'dead\n')
+    const old = (Date.now() - 60_000) / 1000
+    utimesSync(join(dir, '.MEMORY.lock'), old, old)
+    const { overlaps, runs } = await contend(dir, 4, { staleMs: 200, waitMs: 5000 })
+    assert.equal(runs, 4)
+    assert.equal(overlaps, 0, `round ${round}: critical sections overlapped after a takeover`)
+    assert.equal(existsSync(join(dir, '.MEMORY.lock')), false)
+  }
+})
+
+test('a live holder keeps its lock past the stale window by heartbeat, and a release never removes another writer\'s lock', async () => {
+  const dir = join(scratch(), 'store')
+  mkdirSync(dir, { recursive: true })
+  const timing = { staleMs: 120, waitMs: 5000 }
+  const { overlaps, runs } = await contend(dir, 2, timing, 300)
+  assert.equal(runs, 2)
+  assert.equal(overlaps, 0, 'a holder writing longer than the stale window is not taken over while it heartbeats')
+
+  const lockPath = join(dir, '.MEMORY.lock')
+  await withStoreLock(dir, async () => {
+    writeFileSync(lockPath, 'someone-else\n')
+  }, timing)
+  assert.equal(readFileSync(lockPath, 'utf8'), 'someone-else\n', 'the release checked ownership and left the other token in place')
+  rmSync(lockPath)
+})
+
+test('saves from two processes with an abandoned lock in place all land in the index', async () => {
+  const dir = join(scratch(), 'store')
+  mkdirSync(dir, { recursive: true })
+  const script = join(scratch(), 'save-many.mjs')
+  writeFileSync(script, [
+    `import { saveMemory } from ${JSON.stringify(new URL('../src/store.js', import.meta.url).href)}`,
+    'const [dir, prefix, count] = process.argv.slice(2)',
+    'for (let index = 0; index < Number(count); index += 1) {',
+    '  await saveMemory(dir, { name: `${prefix}-${index}`, description: "d", type: "project", title: `${prefix} ${index}`, hook: "h", content: "c", sessionId: prefix })',
+    '}',
+  ].join('\n'))
+  const { execFile } = await import('node:child_process')
+  const { utimesSync } = await import('node:fs')
+  const run = (prefix) => new Promise((resolve, reject) => {
+    execFile(process.execPath, [script, dir, prefix, '20'], (error, _stdout, stderr) => error ? reject(new Error(stderr || error.message)) : resolve())
+  })
+  for (let round = 0; round < 3; round += 1) {
+    writeFileSync(join(dir, '.MEMORY.lock'), 'dead\n')
+    const old = (Date.now() - 60_000) / 1000
+    utimesSync(join(dir, '.MEMORY.lock'), old, old)
+    await Promise.all([run(`web${round}`), run(`headless${round}`)])
+    const lines = readFileSync(join(dir, 'MEMORY.md'), 'utf8').split('\n').filter(Boolean)
+    assert.equal(lines.length, 40 * (round + 1), `round ${round}: an index update was lost during takeover`)
+  }
 })
 
 test('the reserved name "memory" is refused before anything touches the disk', async () => {
@@ -221,6 +298,32 @@ test('memory_save and memory_delete write the calling session\'s own store throu
   assert.equal(missing.isError, false)
   assert.equal(missing.value.existed, false)
   assert.match(text(missing), /nothing to delete/)
+})
+
+test('unloading the real tool runtime makes the next message say the store cannot be written', async () => {
+  const ownHome = scratch()
+  const project = scratch()
+  const ctx = new Context()
+  await ctx.plugin(SystemPrompt)
+  const runtime = await ctx.plugin(ToolRuntime)
+  await ctx.plugin(SessionStore)
+  await ctx.plugin(SessionProjectionRegistry)
+  apply(ctx, Config({ ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: false, dsh: true } }))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const session = ctx.sessions.create(SessionId('memory-unload-1'), { meta: { cwd: project } })
+  const agent = { id: session.id, session }
+  const user = { id: 'u', role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }
+  const step = () => ctx.waterfall('agent/pre-step', { agent, messages: [user], turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages: [user] }))
+  const before = await step()
+  assert.equal(before.messages.length, 2)
+  assert.ok(before.messages[1].content[0].text.includes('memory_save'), 'with the runtime loaded the tools are taught')
+  assert.ok(ctx.tools.schemas().some((schema) => schema.name === SAVE_TOOL_NAME))
+  await runtime.dispose()
+  assert.equal(ctx.get('tools'), undefined, 'the tool service is gone')
+  const after = await step()
+  const text = after.messages[1].content[0].text
+  assert.ok(text.includes('This host offers no memory tools'), 'the effect disposer reset the flag when the scope unloaded')
+  assert.ok(!text.includes('memory_save'))
 })
 
 test('the tools write to the main repository\'s store from a linked worktree, and are absent without an own store', async () => {
