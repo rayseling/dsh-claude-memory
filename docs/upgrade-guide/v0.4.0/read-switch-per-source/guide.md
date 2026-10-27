@@ -7,7 +7,7 @@ description: "enabledByDefault 被按来源的 readByDefault 取代,/memory 语�
 
 ## 变更
 
-0.4.0 的 `/memory on|off|status` 是一个总开关,配置项 `enabledByDefault`(默认 `false`)决定没切换过的会话;composer 上是一个 "Claude Code 记忆" pill。0.5.0 起记忆有两个来源,`claude`(Claude Code 索引)和 `dsh`(dsh 自己的目录),读取按来源分别开关:`/memory <source> on|off`,裸 `/memory on|off` 作用于全部来源,`/memory status` 回显每个来源。没切换过的来源取配置项 `readByDefault`,默认 `{ claude: false, dsh: true }`;`enabledByDefault` 键被忽略。`ownMemory: false` 的 profile 没有 `dsh` 来源:状态回显和菜单只列 `claude`,`/memory dsh on|off` 报错。composer 上变成一个"记忆"按钮,点开后每个来源一行、各自开关;按钮文字列出正在读的来源。写记忆不受这些开关影响,只能用 `ownMemory: false` 关。
+0.4.0 的 `/memory on|off|status` 是一个总开关,配置项 `enabledByDefault`(默认 `false`)决定没切换过的会话;composer 上是一个 "Claude Code 记忆" pill。0.5.0 起记忆有两个来源,`claude`(Claude Code 索引)和 `dsh`(dsh 自己的目录),读取按来源分别开关:`/memory <source> on|off`,裸 `/memory on|off` 作用于全部来源,`/memory status` 回显每个来源。没切换过的来源取配置项 `readByDefault`,默认 `{ claude: false, dsh: true }`;`enabledByDefault` 键被忽略。`ownMemory: false` 的 profile 没有 `dsh` 来源:状态回显和菜单只列 `claude`,`/memory dsh on|off` 报错。composer 上变成一个"记忆"按钮,点开后每个来源一行、各自开关;按钮文字列出正在读的来源。写记忆不受这些开关影响;关它的途径是 `ownMemory: false`,此外 read-only 会话和未配 `includeSubagents` 的子代理会被工具拒绝。
 
 命令回显从 `Claude Code memory is on` 改为 `Memory read: claude off, dsh on` 这一形态。投影 `claudeMemoryMode` 的 `stateVersion` 从 2 升到 3,状态从 `{ enabled }` 改为 `{ read: { [source]: boolean } }`;旧 checkpoint 被丢弃并从日志重算。0.4.0 写下的 `plugin:claude-memory/mode` 记录没有 `source`,按 `claude` 来源折叠,所以运行过 `/memory on|off` 的旧会话保留它对 Claude Code 索引的选择。wire view 从 `{ enabled }` 改为 `{ sources: [{ id, enabled }] }`。
 

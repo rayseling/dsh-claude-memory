@@ -259,9 +259,11 @@ export function decodeCompletePrefix(buffer) {
  * @returns {{ text: string, truncated: boolean }} the bounded text and whether anything was cut.
  */
 export function truncateIndex(text, { maxLines, maxChars }) {
-  // A newline-terminated file has no extra line after its last newline.
-  const lines = text.replace(/\n$/, '').split('\n')
-  if (lines.length <= maxLines && text.length <= maxChars) return { text, truncated: false }
+  // Trailing blank lines are not entries, and the final newline is not counted
+  // against the character cap, the same measure the save tool reports.
+  const body = text.replace(/\n+$/, '')
+  const lines = body.split('\n')
+  if (lines.length <= maxLines && body.length <= maxChars) return { text, truncated: false }
   const kept = lines.length > maxLines ? lines.slice(0, maxLines) : lines
   let out = kept.join('\n')
   let truncated = kept.length < lines.length
@@ -322,10 +324,10 @@ export async function readIndex(path, limits) {
  * that section is rendered before its first entry and carries the writing
  * rules. The completeness claim is scoped to the indexes shown: a source that
  * is switched off is absent, not deleted.
- * @param {{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded?: boolean, writable?: boolean }, maxLines?: number }} stores -
+ * @param {{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded?: boolean, unwritable?: 'no-tools' | 'read-only' }, maxLines?: number }} stores -
  *   the located and bounded indexes; `own.text` is undefined while the store has no entries,
  *   `own.loaded: false` says the session does not read that index, so the model is told to read it before writing,
- *   `own.writable: false` says the host registered no memory tools, so the writing rules are replaced by that fact;
+ *   `own.unwritable` names why this session cannot write the store, replacing the writing rules by that fact;
  *   `maxLines` is the index cap the model is warned about (default 200).
  * @returns {string} the complete `<system-reminder>` block.
  */
@@ -349,15 +351,18 @@ export function renderMemoryMessage({ claude, own, maxLines = 200 }) {
   }
   if (own !== undefined) {
     const dir = dirname(own.path)
+    const writable = own.unwritable === undefined
     if (own.loaded === false) {
-      parts.push('', `Your own memory for this project lives in ${dir}. Its index ${own.path} is not loaded in this session; \`cat\` it before saving so you do not duplicate an entry.`)
+      parts.push('', `Your own memory for this project lives in ${dir}. Its index ${own.path} is not loaded in this session${writable ? '; `cat` it before saving so you do not duplicate an entry' : ''}.`)
     } else if (own.text === undefined) {
       parts.push('', `Your own memory for this project lives in ${dir}. It has no entries yet.`)
     } else {
       parts.push('', `Contents of ${own.path} (your own memory index for this project; its files live in ${dir}).${rest(own.truncated)}`, '', framed(own.text))
     }
-    if (own.writable === false) {
+    if (own.unwritable === 'no-tools') {
       parts.push('', 'This host offers no memory tools, so the store cannot be written from this session.')
+    } else if (own.unwritable === 'read-only') {
+      parts.push('', 'This session is read-only under the file policy, so the store cannot be written from it.')
     } else parts.push(
       '',
       `Save a memory with the \`memory_save\` tool when you learn something a future session in this project would need and the repository itself does not record: who the user is and how they prefer to work (type \`user\`); a correction or confirmed approach the user gave, with its reason (\`feedback\`); ongoing work, goals, or constraints not derivable from the code or git history (\`project\`); a URL, ticket, or dashboard worth returning to (\`reference\`). Do not save what the code, the instruction files, or the git history already record, or what matters only to this conversation; when the user asks you to remember such a thing, ask what was non-obvious about it and save that instead. Before saving, check your own index${claude === undefined ? '' : ' and the Claude Code index'} for an entry that already covers the fact: save under the same name to update your own entry instead of adding a duplicate, and \`memory_delete\` an entry of yours that turned out to be wrong. The tools are the only way to write this store; never edit ${dir} with file tools. Each memory holds one fact, with dates written in full; for feedback and project, end the content with **Why:** and **How to apply:** lines, and link related memories as [[their-name]]. The index is loaded up to ${maxLines} lines; the save tool reports when it nears or passes that, and you keep it below by merging and deleting, not by writing less.`,

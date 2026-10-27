@@ -304,6 +304,11 @@ export function apply(ctx, config) {
    */
   const resolveRead = (mode) => Object.fromEntries(SOURCES.map((id) => [id, sources.includes(id) && (mode.read[id] ?? config.readByDefault[id])]))
   const sameRead = (a, b) => SOURCES.every((id) => a[id] === b[id])
+  /** Whether the host's sandbox policy, when composed, confines this session to `read-only`. */
+  const readOnly = (session) => {
+    const policy = ctx.get('sandboxPolicy')
+    return policy !== undefined && policy.resolve({ session }).mode === 'read-only'
+  }
 
   ctx.sessionProjections.register({
     key: MODE_PROJECTION_KEY,
@@ -336,10 +341,14 @@ export function apply(ctx, config) {
         const cwd = session?.header?.cwd
         if (cwd === undefined) throw new Error(`${exec.name ?? 'memory tool'} needs a session with a working directory; this call has none`)
         if (session.header.origin === 'subagent' && !config.includeSubagents) throw new Error('memory is not available to subagents in this profile (includeSubagents is off)')
-        const policy = ctx.get('sandboxPolicy')
-        if (policy !== undefined && policy.resolve({ session }).mode === 'read-only') throw new Error('this session is read-only under the file policy; memory cannot be written')
+        if (readOnly(session)) throw new Error('this session is read-only under the file policy; memory cannot be written')
         return ownMemoryDir(cwd, ownMemoryHome)
       }
+      const disposers = []
+      // Both tools or neither: a half-registered pair would leave the framing wrong either way.
+      toolCtx.on?.('dispose', () => {
+        toolsRegistered = false
+      })
       /**
        * Claude Code measures the index after every write: near a cap it
        * reminds the model to shorten it; over a cap the write stands but the
@@ -358,7 +367,7 @@ export function apply(ctx, config) {
         }
       }
       try {
-        toolCtx.tools.register(defineTool({
+        disposers.push(toolCtx.tools.register(defineTool({
           name: SAVE_TOOL_NAME,
           description: 'Save one memory of this project into your own memory store (create it, or update the entry with the same name), and keep its index line current. Use it for facts a future session needs that the repository does not record; never for Claude Code\'s memory, which is read-only.',
           parameters: {
@@ -385,7 +394,7 @@ export function apply(ctx, config) {
           },
           isConcurrencySafe: () => false,
           async execute(args, exec) {
-            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens), got ${JSON.stringify(args.name)}`)
+            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens) and not the reserved "memory", got ${JSON.stringify(args.name)}`)
             for (const field of ['title', 'description', 'hook', 'content']) {
               if (args[field].trim().length === 0) throw new Error(`${field} must not be empty`)
             }
@@ -393,8 +402,8 @@ export function apply(ctx, config) {
             const saved = await saveMemory(dir, { ...args, sessionId: String(exec.agent.session.id) })
             return { path: saved.path, created: saved.created, indexLines: saved.indexLines, indexChars: saved.indexChars, indexNote: indexVerdict(saved) }
           },
-        }))
-        toolCtx.tools.register(defineTool({
+        })))
+        disposers.push(toolCtx.tools.register(defineTool({
           name: DELETE_TOOL_NAME,
           description: 'Delete one memory of yours from this project\'s own memory store and drop its index line. Only your own store; Claude Code\'s memory cannot be deleted from here.',
           parameters: {
@@ -414,15 +423,17 @@ export function apply(ctx, config) {
           },
           isConcurrencySafe: () => false,
           async execute(args, exec) {
-            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens), got ${JSON.stringify(args.name)}`)
+            if (!isMemoryName(args.name)) throw new Error(`name must be lower-case kebab-case (letters, digits, single hyphens) and not the reserved "memory", got ${JSON.stringify(args.name)}`)
             const dir = await dirOf(exec)
             const removed = await deleteMemory(dir, args.name)
             return { path: removed.path, existed: removed.removedFile || removed.removedLines > 0, indexLines: removed.indexLines }
           },
-        }))
+        })))
         toolsRegistered = true
       } catch (error) {
-        // A name collision on an optional tool must not disable injection.
+        // A name collision on an optional tool must not disable injection,
+        // and the tool that did register is withdrawn so the framing stays true.
+        for (const dispose of disposers) dispose()
         ctx.logger.warn(`claude-memory: cannot register the memory tools: ${error.message}`)
       }
     })
@@ -502,7 +513,8 @@ export function apply(ctx, config) {
       warnOnce(session, located.path, `claude-memory: cannot read ${located.path}: ${error.message}`)
       return { kind: 'error' }
     }
-    const value = index.text.trim().length === 0 ? { kind: 'blank' } : { kind: 'text', ...index }
+    // A blank window of a file that continues past it says nothing about the rest.
+    const value = index.text.trim().length === 0 && !index.truncated ? { kind: 'blank' } : { kind: 'text', ...index }
     bounded.set(located.path, { size: located.size, mtimeMs: located.mtimeMs, value })
     return value
   }
@@ -548,11 +560,12 @@ export function apply(ctx, config) {
       }
       if (own !== undefined) {
         if (!toolsRegistered) warnOnce(session, 'tools', `claude-memory: the host registered no memory tools; session ${session.id} is told its own store cannot be written`)
-        stores.own = { path: own.path, truncated: false, loaded: read.dsh, writable: toolsRegistered }
+        const unwritable = !toolsRegistered ? 'no-tools' : readOnly(session) ? 'read-only' : undefined
+        stores.own = { path: own.path, truncated: false, loaded: read.dsh, ...(unwritable === undefined ? {} : { unwritable }) }
         if (read.dsh && own.size !== undefined) {
           const index = await currentIndex(session, own)
           if (index.kind === 'error') stores.own.loaded = false
-          else if (index.kind === 'text') stores.own = { path: own.path, text: index.text, truncated: index.truncated, loaded: true, writable: toolsRegistered }
+          else if (index.kind === 'text') stores.own = { ...stores.own, text: index.text, truncated: index.truncated, loaded: true }
         }
       }
     }
@@ -577,12 +590,13 @@ export function apply(ctx, config) {
     const state = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)
     if (state === undefined) throw new Error('claude-memory requires its session projection to be registered')
     const stores = await currentStores(session, cwd, signal, read)
-    if (stores === undefined) return decision
+    // A store that could not be inspected would be missing from any message
+    // entered now, which the model would read as "not being read"; say nothing.
+    if (stores === undefined || stores.incomplete) return decision
     let message
     if (stores.claude === undefined && stores.own === undefined) {
-      // Nothing to show: withdraw an index the model has seen, otherwise stay
-      // silent. A store that could not be inspected is not "nothing to show".
-      if (stores.incomplete || state.digest === null || state.path === null) return decision
+      // Nothing to show: withdraw an index the model has seen, otherwise stay silent.
+      if (state.digest === null || state.path === null) return decision
       message = snapshotMessage(renderWithdrawnMessage(state.path), state.path)
     } else {
       message = snapshotMessage(renderMemoryMessage({ ...stores, maxLines: limits.maxLines }), stores.claude?.path ?? stores.own.path)

@@ -9,7 +9,7 @@
  * @module dsh-claude-memory/store
  */
 
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { isAbsence } from './locate.js'
 
@@ -20,20 +20,35 @@ export const MEMORY_TYPES = Object.freeze(['user', 'feedback', 'project', 'refer
 const NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 /**
+ * Stems a memory may not take: `memory` is `MEMORY.md` on a case-insensitive
+ * file system (APFS by default), so saving it would overwrite the index and
+ * deleting it would remove the index.
+ */
+const RESERVED_NAMES = new Set(['memory'])
+
+/**
  * @param {string} name - candidate memory name.
- * @returns {boolean} whether it is a valid file stem.
+ * @returns {boolean} whether it is a valid, unreserved file stem.
  */
 export function isMemoryName(name) {
-  return typeof name === 'string' && name.length <= 100 && NAME_PATTERN.test(name)
+  return typeof name === 'string' && name.length <= 100 && NAME_PATTERN.test(name) && !RESERVED_NAMES.has(name.toLowerCase())
 }
 
 /**
- * One line of text with no line breaks, for frontmatter values and the index.
+ * @param {string} name
+ * @throws {TypeError} when the name is not a valid, unreserved stem; the store never touches the disk for such a name.
+ */
+function assertMemoryName(name) {
+  if (!isMemoryName(name)) throw new TypeError(`not a memory name: ${JSON.stringify(name)}`)
+}
+
+/**
+ * One line of text with no line breaks of any kind, for frontmatter values and the index.
  * @param {string} text
  * @returns {string}
  */
 function oneLine(text) {
-  return text.replace(/\s*\n\s*/g, ' ').trim()
+  return text.replace(/\s*(?:\r\n|\r|\n)\s*/g, ' ').trim()
 }
 
 /**
@@ -89,20 +104,22 @@ export function renderIndexLine({ name, title, hook }) {
 }
 
 /**
- * Whether an index line is the entry for `<name>.md`: the line's leading
- * link, the one part of a line the writer controls, points at it. A later
- * occurrence inside a hook is not an identity.
+ * Whether an index line is the entry for `<name>.md`: a list item (any
+ * marker, any indentation) whose leading link, the one part of a line the
+ * writer controls, points at it. A later occurrence inside a hook is not an
+ * identity.
  * @param {string} line
  * @param {string} name
  * @returns {boolean}
  */
 function pointsAt(line, name) {
-  return new RegExp(`^-\\s+\\[[^\\]]*\\]\\(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.md\\)`).test(line)
+  return new RegExp(`^\\s*[-*+]\\s+\\[[^\\]]*\\]\\(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.md\\)`).test(line)
 }
 
 /**
  * Replace the line that points at `name` or append one; the rest of the
- * index is kept byte for byte.
+ * index is kept byte for byte. Further lines pointing at the same name
+ * (hand edits) are dropped, so the index has one line per memory.
  * @param {string} index - current index text ('' when the file is absent).
  * @param {string} name - memory name.
  * @param {string} line - the new line.
@@ -111,9 +128,9 @@ function pointsAt(line, name) {
 export function upsertIndexLine(index, name, line) {
   const lines = index.length === 0 ? [] : index.replace(/\n$/, '').split('\n')
   const at = lines.findIndex((existing) => pointsAt(existing, name))
-  if (at === -1) lines.push(line)
-  else lines[at] = line
-  return { text: `${lines.join('\n')}\n`, replaced: at !== -1, lines: lines.length }
+  const kept = at === -1 ? [...lines, line] : lines.filter((existing, position) => position === at || !pointsAt(existing, name))
+  if (at !== -1) kept[at] = line
+  return { text: `${kept.join('\n')}\n`, replaced: at !== -1, lines: kept.length }
 }
 
 /**
@@ -153,11 +170,56 @@ async function writeAtomic(path, text) {
   await rename(temp, path)
 }
 
-/** Pending write per directory, so two sessions of one project update the index in turn. */
+/** Pending write per directory, so two sessions of one process update the index in turn. */
 const queues = new Map()
 
+/** How long a lock file may sit before it is presumed abandoned by a dead process. */
+const LOCK_STALE_MS = 10_000
+
+/** How long a writer waits for the lock before giving up. */
+const LOCK_WAIT_MS = 10_000
+
 /**
- * Run `task` after every earlier task on the same directory has settled.
+ * Hold `<dir>/.MEMORY.lock` while `task` runs, so writers in other processes
+ * (a web and a headless session of one project) read and rewrite the index in
+ * turn. The lock is an exclusively created file; a lock older than
+ * {@link LOCK_STALE_MS} is removed as abandoned.
+ * @template T
+ * @param {string} dir
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
+async function locked(dir, task) {
+  const lockPath = join(dir, '.MEMORY.lock')
+  const deadline = Date.now() + LOCK_WAIT_MS
+  for (;;) {
+    let handle
+    try {
+      handle = await open(lockPath, 'wx')
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      const info = await stat(lockPath).catch(() => undefined)
+      if (info !== undefined && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+        await rm(lockPath, { force: true })
+        continue
+      }
+      if (Date.now() > deadline) throw new Error(`memory store ${dir} is locked by another writer (${lockPath}); try again`)
+      await new Promise((resolve) => setTimeout(resolve, 15 + Math.random() * 20))
+      continue
+    }
+    try {
+      await handle.writeFile(`${process.pid}\n`)
+      await handle.close()
+      return await task()
+    } finally {
+      await rm(lockPath, { force: true })
+    }
+  }
+}
+
+/**
+ * Run `task` after every earlier task on the same directory in this process
+ * has settled, under the cross-process lock.
  * @template T
  * @param {string} dir
  * @param {() => Promise<T>} task
@@ -165,7 +227,7 @@ const queues = new Map()
  */
 function serialized(dir, task) {
   const previous = queues.get(dir) ?? Promise.resolve()
-  const run = previous.then(task, task)
+  const run = previous.then(() => locked(dir, task), () => locked(dir, task))
   queues.set(dir, run.catch(() => {}))
   return run
 }
@@ -175,18 +237,21 @@ function serialized(dir, task) {
  * @param {string} dir - the project's own memory directory, created when missing.
  * @param {{ name: string, description: string, type: string, title: string, hook: string, content: string, sessionId: string, modified?: Date }} memory
  * @returns {Promise<{ path: string, indexPath: string, created: boolean, indexLines: number, indexChars: number }>} where the file
- *   went, whether it is new (no index line pointed at it before), and the index's line and UTF-16 code unit counts after the
- *   write, which the caller measures against the read caps the way Claude Code does after every index write.
+ *   went, whether it is new (no index line pointed at it before), and the index's line and UTF-16 code unit counts (without
+ *   the final newline, as the reader counts) after the write, which the caller measures against the read caps the way Claude
+ *   Code does after every index write.
+ * @throws {TypeError} for a name that is not a valid, unreserved stem; nothing is written.
  */
-export function saveMemory(dir, memory) {
+export async function saveMemory(dir, memory) {
+  assertMemoryName(memory.name)
+  await mkdir(dir, { recursive: true })
   return serialized(dir, async () => {
-    await mkdir(dir, { recursive: true })
     const path = join(dir, `${memory.name}.md`)
     const indexPath = join(dir, 'MEMORY.md')
     await writeAtomic(path, renderMemoryFile({ ...memory, modified: memory.modified ?? new Date() }))
     const index = upsertIndexLine(await readOrEmpty(indexPath), memory.name, renderIndexLine(memory))
     await writeAtomic(indexPath, index.text)
-    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.length }
+    return { path, indexPath, created: !index.replaced, indexLines: index.lines, indexChars: index.text.replace(/\n$/, '').length }
   })
 }
 
@@ -210,8 +275,11 @@ export function judgeIndex({ indexLines, indexChars }, { maxLines, maxChars }) {
  * @param {string} dir - the project's own memory directory.
  * @param {string} name - memory name.
  * @returns {Promise<{ path: string, indexPath: string, removedFile: boolean, removedLines: number, indexLines: number }>}
+ * @throws {TypeError} for a name that is not a valid, unreserved stem; nothing is removed.
  */
-export function deleteMemory(dir, name) {
+export async function deleteMemory(dir, name) {
+  assertMemoryName(name)
+  await mkdir(dir, { recursive: true })
   return serialized(dir, async () => {
     const path = join(dir, `${name}.md`)
     const indexPath = join(dir, 'MEMORY.md')

@@ -50,7 +50,7 @@ const lastModeEvent = (session) => session.snapshotEvents().filter((event) => ev
  * store on) have their own tests. The own store's home always points into a
  * scratch directory so no test reads the developer's `~/.dsh/memory`.
  */
-function mount(config = {}, { withCommands = false, commandError = undefined, withTools = true, expectDsh = undefined, sandboxMode = undefined } = {}) {
+function mount(config = {}, { withCommands = false, commandError = undefined, withTools = true, expectDsh = undefined, sandboxMode = undefined, toolError = undefined } = {}) {
   const logs = []
   let listener
   const definitions = new Map()
@@ -71,7 +71,17 @@ function mount(config = {}, { withCommands = false, commandError = undefined, wi
     },
     inject(deps, callback) {
       if (deps.includes('tools')) {
-        if (withTools) callback({ tools: { register(definition) { tools.push(definition); return () => {} } } })
+        if (withTools) {
+          callback({
+            tools: {
+              register(definition) {
+                if (toolError !== undefined && definition.name === toolError) throw new Error(`duplicate tool ${definition.name}`)
+                tools.push(definition)
+                return () => { tools.splice(tools.indexOf(definition), 1) }
+              },
+            },
+          })
+        }
         return
       }
       if (!withCommands || !deps.includes('commands')) return
@@ -239,7 +249,40 @@ test('a relative ownMemoryHome turns the own store off with a warning instead of
   assert.equal(tools.length, 0, 'no write tools without a store')
   assert.deepEqual(modeDefinition.wire.view({ read: {} }).sources.map((source) => source.id), ['claude'])
   const text = (await run(listener, { agent: fakeAgent({ cwd: project }) })).messages[1].content[0].text
-  assert.ok(!text.includes('memory_save'), 'the Claude Code index still enters, without an own section')
+  assert.ok(text.includes('- [Reply in Chinese](reply-in-chinese.md)'), 'the Claude Code index still enters')
+  assert.ok(!text.includes('memory_save') && !text.includes('Your own memory'), 'without an own section')
+})
+
+test('a tool-name collision withdraws the tool that did register, so the framing says the store cannot be written', async () => {
+  const ownHome = scratch()
+  const project = scratch()
+  const { listener, logs, tools } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome }, { toolError: 'memory_delete' })
+  assert.deepEqual(tools, [], 'memory_save was registered, then withdrawn')
+  assert.match(logs[0][1], /cannot register the memory tools: duplicate tool memory_delete/)
+  const text = (await run(listener, { agent: fakeAgent({ cwd: project }) })).messages[1].content[0].text
+  assert.ok(text.includes('This host offers no memory tools'))
+})
+
+test('a read-only session is told the store cannot be written instead of being taught the tools', async () => {
+  const { ownHome, project } = seedOwn()
+  const { listener } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome }, { sandboxMode: 'read-only' })
+  const text = (await run(listener, { agent: fakeAgent({ cwd: project }) })).messages[1].content[0].text
+  assert.ok(text.includes('This session is read-only under the file policy, so the store cannot be written from it.'))
+  assert.ok(text.includes('- [Deploy host](deploy-host.md)'), 'the index still reads')
+  assert.ok(!text.includes('memory_save'))
+})
+
+test('a blank window of an index that continues past it is not blank', async () => {
+  const { home, project } = seedProject('\n\n- [real](real.md) — past the cap\n')
+  const { listener, commit } = mount({ claudeHome: home, maxLines: 2 })
+  const agent = fakeAgent({ cwd: project })
+  const first = await run(listener, { agent })
+  assert.equal(first.messages.length, 2)
+  const text = first.messages[1].content[0].text
+  assert.ok(text.includes('Only the beginning of this index is shown'), 'shown as a truncated index, not withdrawn as blank')
+  assert.ok(!text.includes('no longer available'))
+  commitAll(commit, agent.session, first, 1)
+  assert.equal((await run(listener, { agent })).messages.length, 1)
 })
 
 test('a host without a tool registry gets the own section without writing rules, and a warning once', async () => {
@@ -274,13 +317,20 @@ test('the write tools refuse subagents without includeSubagents and read-only se
   assert.equal((await sharedSave.execute(args, exec({ cwd: project, origin: 'subagent' }))).created, true)
 })
 
-test('an own store that cannot be located never withdraws a shown index', async () => {
+test('an own store that cannot be located enters nothing this turn, even when the Claude Code index could', async () => {
   const { ownHome, project } = seedOwn()
-  const { listener, commit, logs } = mount({ claudeHome: scratch(), ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: false, dsh: true } })
+  const { home } = seedProject()
+  const claudeDir = join(home, 'projects', slugOf(project), 'memory')
+  mkdirSync(claudeDir, { recursive: true })
+  writeFileSync(join(claudeDir, 'MEMORY.md'), '- claude line\n')
+  const { listener, commit, logs } = mount({ claudeHome: home, ownMemory: true, ownMemoryHome: ownHome, readByDefault: { claude: true, dsh: true } })
   const agent = fakeAgent({ cwd: project })
   const first = await run(listener, { agent })
   assert.equal(first.messages.length, 2)
+  assert.ok(first.messages[1].content[0].text.includes('- claude line'))
   commitAll(commit, agent.session, first, 1)
+  writeFileSync(join(claudeDir, 'MEMORY.md'), '- claude line changed\n')
+  utimesSync(join(claudeDir, 'MEMORY.md'), new Date(Date.now() + 5000), new Date(Date.now() + 5000))
   // A `.git` file that cannot be read makes canonicalRoot throw, so the own store cannot be located.
   const { chmodSync, readFileSync } = await import('node:fs')
   writeFileSync(join(project, '.git'), 'gitdir: /nowhere\n')
@@ -290,8 +340,8 @@ test('an own store that cannot be located never withdraws a shown index', async 
   try {
     if (!readable) {
       const next = await run(listener, { agent })
-      assert.equal(next.messages.length, 1, 'the only section could not be checked: nothing entered, no withdrawal')
-      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('own memory index')))
+      assert.equal(next.messages.length, 1, 'a changed Claude index would enter a message without the own section: nothing entered, no withdrawal')
+      assert.ok(logs.some(([level, line]) => level === 'warn' && line.includes('cannot inspect')))
     }
   } finally {
     chmodSync(join(project, '.git'), 0o644)
