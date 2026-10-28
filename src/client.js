@@ -4,11 +4,9 @@
  * The DSH client module system loads this file as a closure factory: the
  * top-level call only registers the factory; the module body runs when the
  * factory materializes. No build step is involved. The plugin registers one
- * composer tool-row control before the model selector: a "Memory" button that
- * opens a menu with one row per memory source from the `claudeMemoryMode`
- * projection view, each row a switch that executes the server command
- * `/memory <source> on|off` for the current session. Rows follow the view, so
- * a source the server adds later appears without a client change.
+ * composer tool-row pill before the model selector over the `claudeMemoryMode`
+ * projection and executes the server command `/memory on|off` for the current
+ * session.
  */
 
 window.__ModuleLoader__.load({
@@ -24,24 +22,18 @@ window.__ModuleLoader__.load({
     const COMMAND_DEFINITION_ID = 'dsh-claude-memory'
     const NS = 'claude-memory'
     const zh = {
-      'button.label': '记忆',
-      'button.none': '记忆:关',
-      'button.title': '选择本会话读取哪些项目记忆',
+      'button.on': 'Claude Code 记忆:开',
+      'button.off': 'Claude Code 记忆:关',
+      'button.busy': '切换中…',
+      'button.title': '切换本会话的 Claude Code 记忆',
       'button.failed': '切换失败',
-      'source.claude': 'Claude Code',
-      'source.dsh': 'DSH',
-      'switch.on': '开',
-      'switch.off': '关',
     }
     const en = {
-      'button.label': 'Memory',
-      'button.none': 'Memory: off',
-      'button.title': 'Choose which project memory this session reads',
+      'button.on': 'Claude Code memory: on',
+      'button.off': 'Claude Code memory: off',
+      'button.busy': 'Switching…',
+      'button.title': 'Toggle Claude Code memory for this session',
       'button.failed': 'Switch failed',
-      'source.claude': 'Claude Code',
-      'source.dsh': 'DSH',
-      'switch.on': 'on',
-      'switch.off': 'off',
     }
     const pillStyle = {
       display: 'inline-flex',
@@ -59,103 +51,63 @@ window.__ModuleLoader__.load({
       whiteSpace: 'nowrap',
       cursor: 'pointer',
     }
-    const menuStyle = {
-      position: 'absolute',
-      bottom: '100%',
-      left: 0,
-      marginBottom: 4,
-      minWidth: 180,
-      padding: 4,
-      borderRadius: 'var(--dsw-radius-md, 8px)',
-      border: '1px solid var(--dsw-alias-border, rgba(127, 127, 127, 0.3))',
-      background: 'var(--dsw-alias-bg-elevated, Canvas)',
-      boxShadow: '0 4px 16px rgba(0, 0, 0, 0.12)',
-      zIndex: 10,
-    }
-    const rowStyle = {
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      gap: 12,
-      width: '100%',
-      height: 28,
-      padding: '0 8px',
-      border: 'none',
-      borderRadius: 'var(--dsw-radius-sm, 6px)',
-      background: 'transparent',
-      color: 'inherit',
-      font: 'inherit',
-      fontSize: 13,
-      cursor: 'pointer',
-      textAlign: 'left',
-    }
 
     /**
-     * Composer tool-row menu over the host-computed mode view: one switch per source.
-     * @param {{ available: boolean, sessionId: string, useProjection: (key: string) => { sources: { id: string, enabled: boolean }[] } | undefined, toggleMemory: (line: string) => Promise<string | null>, t: (key: string) => string }} props
+     * Composer tool-row switch over the host-computed mode view.
+     * @param {{ available: boolean, sessionId: string, useProjection: (key: string) => { enabled: boolean } | undefined, toggleMemory: (line: string) => Promise<string | null>, t: (key: string) => string }} props
      */
-    function MemoryMenu({ available, sessionId, useProjection, toggleMemory, t }) {
+    function MemoryPill({ available, sessionId, useProjection, toggleMemory, t }) {
       const mode = useProjection(MODE_KEY)
-      const [open, setOpen] = React.useState(false)
-      const [busy, setBusy] = React.useState(null)
+      const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
+      const [hover, setHover] = React.useState(false)
       const alive = React.useRef(true)
       const request = React.useRef(0)
-      const sourcesKey = mode === undefined ? '' : mode.sources.map((source) => `${source.id}:${source.enabled}`).join(',')
       React.useEffect(() => {
         alive.current = true
         return () => { alive.current = false }
       }, [])
       React.useEffect(() => {
         request.current += 1
-        setBusy(null)
+        setBusy(false)
         setError(null)
-      }, [sessionId, sourcesKey])
-      React.useEffect(() => {
-        setOpen(false)
-      }, [sessionId])
+      }, [sessionId, mode?.enabled])
       if (!available || mode === undefined) return null
-      const enabledNames = mode.sources.filter((source) => source.enabled).map((source) => t(`source.${source.id}`))
-      const label = enabledNames.length === 0 ? t('button.none') : `${t('button.label')}: ${enabledNames.join(' + ')}`
-      const onSwitch = (source) => {
-        if (busy !== null) return
+      const enabled = mode.enabled !== false
+      const label = busy ? t('button.busy') : enabled ? t('button.on') : t('button.off')
+      const onClick = () => {
+        if (busy) return
         const token = ++request.current
-        setBusy(source.id)
+        setBusy(true)
         setError(null)
-        void toggleMemory(`/memory ${source.id} ${source.enabled ? 'off' : 'on'}`).then((failure) => {
+        void toggleMemory(enabled ? '/memory off' : '/memory on').then((failure) => {
           if (!alive.current || request.current !== token) return
-          setBusy(null)
+          setBusy(false)
           if (failure !== null) setError(failure)
         }, (reason) => {
           if (!alive.current || request.current !== token) return
-          setBusy(null)
+          setBusy(false)
           setError(reason instanceof Error ? reason.message : String(reason))
         })
       }
       const button = React.createElement('button', {
         type: 'button',
-        'aria-haspopup': 'menu',
-        'aria-expanded': open,
+        'aria-pressed': enabled,
         title: t('button.title'),
-        onClick: () => setOpen(!open),
-        style: pillStyle,
+        disabled: busy,
+        onClick,
+        onMouseEnter: () => setHover(true),
+        onMouseLeave: () => setHover(false),
+        style: {
+          ...pillStyle,
+          background: hover && !busy ? 'var(--dsw-alias-interactive-bg-hover, rgba(127, 127, 127, 0.12))' : 'transparent',
+          opacity: busy ? 0.6 : 1,
+        },
       }, label)
-      const rows = mode.sources.map((source) => React.createElement('button', {
-        key: source.id,
-        type: 'button',
-        role: 'menuitemcheckbox',
-        'aria-checked': source.enabled,
-        disabled: busy !== null,
-        onClick: () => onSwitch(source),
-        style: { ...rowStyle, opacity: busy === source.id ? 0.6 : 1 },
-      },
-      React.createElement('span', null, t(`source.${source.id}`)),
-      React.createElement('span', { style: { opacity: 0.75 } }, t(source.enabled ? 'switch.on' : 'switch.off'))))
-      const menu = open ? React.createElement('div', { role: 'menu', style: menuStyle }, ...rows) : null
-      const status = error === null
-        ? null
-        : React.createElement('span', { role: 'status', title: error, style: { fontSize: 12, opacity: 0.75 } }, t('button.failed'))
-      return React.createElement('span', { style: { position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 4 } }, button, menu, status)
+      if (error === null) return button
+      return React.createElement('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+        button,
+        React.createElement('span', { role: 'status', title: error, style: { fontSize: 12, opacity: 0.75 } }, t('button.failed')))
     }
 
     /**
@@ -184,7 +136,7 @@ window.__ModuleLoader__.load({
             return null
           },
         }),
-      }, MemoryMenu))
+      }, MemoryPill))
     }
 
     exports.name = 'claude-memory-ui'

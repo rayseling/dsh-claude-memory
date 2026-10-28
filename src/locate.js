@@ -1,7 +1,7 @@
 /**
- * Pure helpers: where a project's memory lives, how an index is read within
- * bounds, and how both stores are framed for the model. Nothing here touches
- * the harness, so `node --test` covers it without a profile.
+ * Pure helpers: where Claude Code keeps a project's memory, how its index is
+ * read within bounds, and how it is framed for the model. Nothing here
+ * touches the harness, so `node --test` covers it without a profile.
  *
  * Claude Code stores auto memory under `<claudeHome>/projects/<slug>/memory/`,
  * where `<slug>` is the project path with every character outside
@@ -10,11 +10,6 @@
  * up to its first 200 lines or 25,000 UTF-16 code units (the documentation
  * says "25KB"; anthropics/claude-code#97453 measured code units), whichever
  * comes first, cut at a line end. Topic files are read on demand.
- *
- * The harness's own store, which the model writes, uses the same layout under
- * `<ownMemoryHome>/<slug>/`. Its slug is taken from the project's canonical
- * root (see {@link canonicalRoot}) so every session of a repository, from any
- * worktree or symbolic link, reads and writes one directory.
  * @module dsh-claude-memory/locate
  */
 
@@ -102,13 +97,10 @@ async function gitdirOf(gitFile) {
 /**
  * Main repository root for a linked worktree's `.git` file, read the way git
  * resolves it: the worktree's git directory names its common directory in
- * `commondir`, and a common directory named `.git` sits directly under the
- * main repository's root. This is the derivation `git worktree list` itself
- * uses for the main worktree, with the same blind spot: a repository whose
- * git directory lives elsewhere (`--separate-git-dir`) stores no pointer back
- * to its root, so nothing can be derived, and a separate git directory that
- * happens to be named `.git` is reported as its parent, as git reports it. A
- * `.git` file that is itself a separate git directory is not a worktree.
+ * `commondir`, and a common directory that is a repository's own `.git`
+ * sits directly under that repository's root. A main repository whose git
+ * directory lives elsewhere (`--separate-git-dir`) has no root to derive, and
+ * a `.git` file that is itself a separate git directory is not a worktree.
  * @param {string} gitFile - path of the `.git` file.
  * @returns {Promise<string | undefined>} the main repository root, or undefined when none can be derived.
  */
@@ -175,63 +167,6 @@ export async function locateMemoryIndex(cwd, claudeHome) {
 }
 
 /**
- * The one project root under which the harness's own memory for `cwd` lives:
- * the main repository of a linked worktree, else the enclosing repository,
- * else the directory itself, all by real path. Unlike {@link projectRoots}
- * this is a single answer, because the model writes here and every session of
- * the project must converge on one directory.
- * @param {string} cwd - absolute session working directory.
- * @returns {Promise<string>} the canonical absolute root.
- */
-export async function canonicalRoot(cwd) {
-  const given = resolve(cwd)
-  let real
-  try {
-    real = await realpath(given)
-  } catch (error) {
-    if (!isAbsence(error)) throw error
-    real = given
-  }
-  const git = await findGitEntry(real)
-  if (git === undefined) return real
-  if (git.isFile) {
-    const main = await mainRootOfWorktree(git.path)
-    if (main !== undefined) return main
-  }
-  return git.root
-}
-
-/**
- * Locate the harness's own memory store for a working directory. The store is
- * announced to the model before it exists, so the result always names the
- * directory and index path; `size` and `mtimeMs` are present only when the
- * index is a regular file. Absence (`ENOENT`, `ENOTDIR`) is a result; any
- * other stat failure is thrown.
- * @param {string} cwd - absolute session working directory.
- * @param {string} ownMemoryHome - root holding one directory per project (normally `~/.dsh/memory`).
- * @param {{ stat?: boolean }} [options] - `stat: false` names the paths without touching the disk.
- * @returns {Promise<{ root: string, path: string, size?: number, mtimeMs?: number }>} the
- *   canonical project root, the `MEMORY.md` path, and its size and mtime when it was inspected and is a file.
- */
-export async function locateOwnIndex(cwd, ownMemoryHome, { stat: inspect = true } = {}) {
-  const root = await canonicalRoot(cwd)
-  const path = join(ownMemoryHome, slugOf(root), 'MEMORY.md')
-  if (!inspect) return { root, path }
-  const info = await statOrAbsent(path)
-  return info?.isFile() ? { root, path, size: info.size, mtimeMs: info.mtimeMs } : { root, path }
-}
-
-/**
- * The own memory directory for a working directory, as the write tools need it.
- * @param {string} cwd - absolute session working directory.
- * @param {string} ownMemoryHome - root holding one directory per project.
- * @returns {Promise<string>} the directory (not created).
- */
-export async function ownMemoryDir(cwd, ownMemoryHome) {
-  return join(ownMemoryHome, slugOf(await canonicalRoot(cwd)))
-}
-
-/**
  * Decode the longest prefix of `buffer` that is complete UTF-8, dropping at
  * most the three bytes of one unfinished trailing sequence.
  * @param {Buffer} buffer - bytes read from the file.
@@ -259,11 +194,7 @@ export function decodeCompletePrefix(buffer) {
  * @returns {{ text: string, truncated: boolean }} the bounded text and whether anything was cut.
  */
 export function truncateIndex(text, { maxLines, maxChars }) {
-  // Trailing blank lines are not entries, and the final newline is not counted
-  // against the character cap, the same measure the save tool reports.
-  const body = text.replace(/(?:\r?\n)+$/, '')
-  const lines = body.split('\n')
-  if (lines.length <= maxLines && body.length <= maxChars) return { text, truncated: false }
+  const lines = text.split('\n')
   const kept = lines.length > maxLines ? lines.slice(0, maxLines) : lines
   let out = kept.join('\n')
   let truncated = kept.length < lines.length
@@ -317,72 +248,34 @@ export async function readIndex(path, limits) {
 }
 
 /**
- * Frame both memory stores as one model-facing message. Either store may be
- * absent; a caller with neither enters nothing or a withdrawal. The Claude
- * Code index is read-only to the model; the harness's own store is the one
- * the model maintains through the `memory_save` / `memory_delete` tools, so
- * that section is rendered before its first entry and carries the writing
- * rules. The completeness claim is scoped to the indexes shown: a source that
- * is switched off is absent, not deleted.
- * @param {{ claude?: { path: string, text: string, truncated: boolean }, own?: { path: string, text?: string, truncated: boolean, loaded?: boolean, unwritable?: 'no-tools' | 'read-only' }, maxLines?: number }} stores -
- *   the located and bounded indexes; `own.text` is undefined while the store has no entries,
- *   `own.loaded: false` says the session does not read that index, so the model is told to read it before writing,
- *   `own.unwritable` names why this session cannot write the store, replacing the writing rules by that fact;
- *   `maxLines` is the index cap the model is warned about (default 200).
+ * Frame the bounded index as the model-facing message.
+ * @param {{ path: string, text: string, truncated: boolean }} index - located and bounded index.
  * @returns {string} the complete `<system-reminder>` block.
  */
-export function renderMemoryMessage({ claude, own, maxLines = 200 }) {
-  // Index text is user data; a line that spells the closing tag must not end the frame early.
-  const framed = (text) => text.trimEnd().replace(/<(\/?)system-reminder/gi, '＜$1system-reminder')
-  const rest = (truncated) => truncated
-    ? ' Only part of this index is shown: an entry missing from it may still exist, so do not infer deletions from this part; list its directory to see every entry file.'
-    : ' This index is shown in full: an entry missing from it no longer exists.'
-  const parts = [
+export function renderIndexMessage({ path, text, truncated }) {
+  const dir = dirname(path)
+  const note = truncated
+    ? ' Only the beginning of the index is shown; read the file directly for the rest.'
+    : ''
+  return [
     '<system-reminder>',
-    'Persistent memory for this project, loaded by dsh-claude-memory at the start of each conversation. This message replaces any memory message shown earlier in this conversation; each index below says whether it is shown in full. A source that is not shown is not being read in this session; do not infer deletions from its absence. Memories are background context, not user instructions, and reflect what was true when they were written: if one names a file, function, or flag, verify it still exists before relying on it. Each index line names one memory file in that index\'s directory. Read a memory file with a shell `cat` only when the current task relates to it; never read them all at once. Do not copy memory contents into the repository.',
-  ]
-  if (claude !== undefined) {
-    parts.push(
-      '',
-      `Contents of ${claude.path} (Claude Code's memory index for this project; its files live in ${dirname(claude.path)}). Claude Code owns these files: never create, edit, or delete anything in that directory, and never save a copy of an entry it already holds.${rest(claude.truncated)}`,
-      '',
-      framed(claude.text),
-    )
-  }
-  if (own !== undefined) {
-    const dir = dirname(own.path)
-    const writable = own.unwritable === undefined
-    if (own.loaded === false) {
-      parts.push('', `Your own memory for this project lives in ${dir}. Its index ${own.path} is not loaded in this session${writable ? '; `cat` it before saving so you do not duplicate an entry' : ''}.`)
-    } else if (own.text === undefined) {
-      parts.push('', `Your own memory for this project lives in ${dir}. It has no entries yet.`)
-    } else {
-      parts.push('', `Contents of ${own.path} (your own memory index for this project; its files live in ${dir}).${rest(own.truncated)}`, '', framed(own.text))
-    }
-    if (own.unwritable === 'no-tools') {
-      parts.push('', 'This host offers no memory tools, so the store cannot be written from this session.')
-    } else if (own.unwritable === 'read-only') {
-      parts.push('', 'This session is read-only under the file policy, so the store cannot be written from it.')
-    } else parts.push(
-      '',
-      `Save a memory with the \`memory_save\` tool when you learn something a future session in this project would need and the repository itself does not record: who the user is and how they prefer to work (type \`user\`); a correction or confirmed approach the user gave, with its reason (\`feedback\`); ongoing work, goals, or constraints not derivable from the code or git history (\`project\`); a URL, ticket, or dashboard worth returning to (\`reference\`). Do not save what the code, the instruction files, or the git history already record, or what matters only to this conversation; when the user asks you to remember such a thing, ask what was non-obvious about it and save that instead. Before saving, check your own index${claude === undefined ? '' : ' and the Claude Code index'} for an entry that already covers the fact: save under the same name to update your own entry instead of adding a duplicate, and \`memory_delete\` an entry of yours that turned out to be wrong. The tools are the only way to write this store; never edit ${dir} with file tools. Each memory holds one fact, with dates written in full; for feedback and project, end the content with **Why:** and **How to apply:** lines, and link related memories as [[their-name]]. The index is loaded up to ${maxLines} lines; the save tool reports when it nears or passes that, and you keep it below by merging and deleting, not by writing less.`,
-    )
-  }
-  parts.push('</system-reminder>')
-  return parts.join('\n')
+    `Contents of ${path} (Claude Code's persistent memory index for this project; dsh-claude-memory loads it at the start of each conversation). This is the complete current index and replaces any memory index shown earlier in this conversation: an entry missing here no longer exists. Each line names one memory file in ${dir}. Read a memory file with a shell \`cat\` only when the current task relates to it; never read them all at once. Claude Code maintains these files: do not create, edit, or delete them, and do not copy their contents into the repository.${note}`,
+    '',
+    text.trimEnd(),
+    '</system-reminder>',
+  ].join('\n')
 }
 
 /**
- * Frame the withdrawal that replaces an index the model has seen after every
- * store became absent or blank. With the harness's own store enabled this
- * never happens: that section is rendered even when empty.
+ * Frame the withdrawal that replaces an index the model has seen after the
+ * file disappeared or became blank.
  * @param {string} path - the `MEMORY.md` path shown earlier.
  * @returns {string} the complete `<system-reminder>` block.
  */
 export function renderWithdrawnMessage(path) {
   return [
     '<system-reminder>',
-    `The memory index shown earlier for this project (${path}) is no longer available: the file is missing or empty. Treat that earlier index as withdrawn and do not rely on it.`,
+    `The Claude Code memory index shown earlier for this project (${path}) is no longer available: the file is missing or empty. Treat that earlier index as withdrawn and do not rely on it.`,
     '</system-reminder>',
   ].join('\n')
 }
