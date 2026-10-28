@@ -14,7 +14,7 @@ dsh-claude-memory 是一个 DeepSeek Harness(dsh)插件:在每个会话第一步
 ## 代码约定
 
 - 纯 ESM JS,无构建。`src/locate.js` 只依赖 `node:fs`(定位、有界读取、截断、渲染),全部异步,不 import 宿主包;`src/index.js` 只做挂载与注入。新逻辑先问能不能放进 `locate.js`。
-- 宿主接口只用六个:`agent/pre-step`(必须 `await next()`)、`session.header.cwd/origin`、`ctx.sessionProjections.register/stateOf`、`createUserMessage`、可选的 `ctx.commands.register`、`appendPluginRecord('plugin:claude-memory/mode')`。不碰 `session.eventAt`/`surface.nodes` 这类同步读历史的接口;多用一个就在这里记一笔。
+- 宿主接口只用六个:`agent/pre-step`(必须 `await next()`)、`session.header.cwd/origin`、`ctx.sessionProjections.register`→句柄 `stateOf`、`createUserMessage`、可选的 `ctx.commands.register`、`appendPluginRecord('plugin:claude-memory/mode')`。不碰 `session.eventAt`/`surface.nodes` 这类同步读历史的接口;多用一个就在这里记一笔。
 - 配置走 `@deepseek-ai/schemastery` 的 `Config`,默认值取 Claude Code 的值(例外:`enabledByDefault`);不加 `DEFAULT_*` 常量。
 - 有 client:`dsh.client` 指向手写 `src/client.js`(无构建,`__ModuleLoader__.load` 闭包);文件缺失会让 `dsh web` 起不来,改完重启 profile:web。
 - 测试用 `node --test`,不启动 dsh:`test/locate.test.js` 用临时目录,`test/plugin.test.js` 用假 ctx/agent 驱动监听器,模式记录走真实 Session。peer 依赖靠仓库根的 `node_modules -> ~/.dsh/profiles/node_modules` 软链。

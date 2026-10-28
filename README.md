@@ -45,6 +45,7 @@ pnpm add link:/path/to/dsh-claude-memory
 - 0.2.0 起 `maxBytes` 改名 `maxChars`(字节改为 UTF-16 code unit);旧键会被静默忽略,请改名。
 - 0.3.0 起 `/memory` 需要宿主提供 `appendPluginRecord`;旧版只警告并继续注入。
 - 0.4.0 起开关默认关;保持始终加载要配 `enabledByDefault: true`([升级指南](docs/upgrade-guide/v0.3.0/memory-default-off/guide.md))。
+- 0.5.0 起要求 dsh ≥ 0.2.2-alpha.2(会话投影改用注册句柄读取);更旧的 dsh 继续用 0.4.0。
 
 ## 开发
 

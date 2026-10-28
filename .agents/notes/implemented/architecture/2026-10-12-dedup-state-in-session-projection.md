@@ -8,7 +8,7 @@ Status: implemented
 
 ## Decision
 
-用 `ctx.sessionProjections.register` 注册 `claudeMemory` 投影:纯折叠,记录本插件最新一条在 surface 上的 snapshot 的 seq/digest/path。`user/message` 命中时更新;`surfaceOp.op === 'replace'` 且事件的 `sourceEventSeqs` 包含该 seq 时清空(宿主要求替换事件列出每个被遮蔽节点),压缩后因此会重新注入。pre-step 只读 `stateOf`。
+用 `ctx.sessionProjections.register` 注册 `claudeMemory` 投影:纯折叠,记录本插件最新一条在 surface 上的 snapshot 的 seq/digest/path。`user/message` 命中时更新;`surfaceOp.op === 'replace'` 且事件的 `sourceEventSeqs` 包含该 seq 时清空(宿主要求替换事件列出每个被遮蔽节点),压缩后因此会重新注入。pre-step 只经 `await register(...)` 得到的句柄 `stateOf(session)` 读;宿主 0.2.2-alpha.2 起按 key 的 `ctx.sessionProjections.stateOf(session, key)` 已弃用。
 
 `stateSchema` 是手写的 `{ parse }`。改了状态字段或折叠语义必须 bump `stateVersion`。
 
